@@ -1,7 +1,10 @@
 package syncshadow
 
 import (
+	"internal/runtime/atomic"
+	"runtime"
 	"testing"
+	"time"
 
 	"runtime/race/kolkov/vectorclock"
 )
@@ -57,6 +60,44 @@ func TestGetOrCreate_DifferentAddresses(t *testing.T) {
 	}
 }
 
+// collidingAddresses returns addresses that map to the same top-level hash
+// bucket. Keeping this in the package (rather than hard-coding addresses) makes
+// the collision regression independent of the particular hash mixer.
+func collidingAddresses(t testing.TB, count int) []uintptr {
+	t.Helper()
+
+	target := fastHashSync(1)
+	addrs := make([]uintptr, 0, count)
+	for page := uintptr(0); len(addrs) < count; page++ {
+		addr := page<<syncPageShift | 1
+		if fastHashSync(addr) == target {
+			addrs = append(addrs, addr)
+		}
+		if page == ^uintptr(0)>>syncPageShift {
+			t.Fatalf("could not find %d colliding addresses", count)
+		}
+	}
+	return addrs
+}
+
+// TestGetOrCreate_CollisionOverflowPreservesEntries guards the happens-before
+// state of every live synchronization object when a hash bucket is crowded.
+func TestGetOrCreate_CollisionOverflowPreservesEntries(t *testing.T) {
+	shadow := NewSyncShadow()
+	addrs := collidingAddresses(t, 17)
+	states := make([]*SyncVar, len(addrs))
+
+	for i, addr := range addrs {
+		states[i] = shadow.GetOrCreate(addr)
+	}
+
+	for i, addr := range addrs {
+		if got := shadow.GetOrCreate(addr); got != states[i] {
+			t.Fatalf("GetOrCreate(%#x) lost its SyncVar after collision overflow", addr)
+		}
+	}
+}
+
 // TestGetOrCreate_Concurrent verifies thread-safe concurrent access.
 func TestGetOrCreate_Concurrent(t *testing.T) {
 	shadow := NewSyncShadow()
@@ -64,12 +105,15 @@ func TestGetOrCreate_Concurrent(t *testing.T) {
 	numGoroutines := 100
 
 	// Launch concurrent goroutines all accessing the same address.
+	start := make(chan struct{})
 	results := make(chan *SyncVar, numGoroutines)
 	for i := 0; i < numGoroutines; i++ {
 		go func() {
+			<-start
 			results <- shadow.GetOrCreate(addr)
 		}()
 	}
+	close(start)
 
 	// Collect all results.
 	firstSV := <-results
@@ -78,6 +122,260 @@ func TestGetOrCreate_Concurrent(t *testing.T) {
 		if sv != firstSV {
 			t.Errorf("Concurrent GetOrCreate returned different SyncVar instances")
 		}
+	}
+
+	page := findPage(&shadow.buckets[fastHashSync(addr)], addr>>syncPageShift)
+	if page == nil {
+		t.Fatal("concurrent publication did not publish its page")
+	}
+	if got := findSyncVar(page, addr); got != firstSV {
+		t.Fatal("concurrent publication exposed a different cell identity")
+	}
+	if stats := shadow.Stats(); stats.LivePages != 1 || stats.LiveEntries != 1 {
+		t.Fatalf("concurrent publication cardinality = %+v, want 1 page and 1 entry", stats)
+	}
+}
+
+func TestSpinlockForcedFallbackAndProgress(t *testing.T) {
+	var lock spinlock
+	lock.lock()
+	if got := lock.state.Load(); got != 1 {
+		t.Fatalf("locked state = %d, want 1", got)
+	}
+
+	var fallbacks atomic.Uint64
+	acquired := make(chan struct{})
+	go func() {
+		lock.lockWithFallbackCounter(&fallbacks)
+		close(acquired)
+		lock.unlock()
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for fallbacks.Load() == 0 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if fallbacks.Load() == 0 {
+		lock.unlock()
+		select {
+		case <-acquired:
+		case <-time.After(2 * time.Second):
+		}
+		t.Fatal("forced contention did not reach the yielding fallback")
+	}
+
+	lock.unlock()
+	select {
+	case <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not acquire after unlock")
+	}
+	if got := lock.state.Load(); got != 0 {
+		t.Fatalf("final lock state = %d, want 0", got)
+	}
+}
+
+func TestSpinlockContentionProgress(t *testing.T) {
+	const (
+		workers    = 16
+		iterations = 1000
+	)
+	var lock spinlock
+	var total int
+	start := make(chan struct{})
+	done := make(chan struct{}, workers)
+	for range workers {
+		go func() {
+			<-start
+			for range iterations {
+				lock.lock()
+				total++
+				lock.unlock()
+			}
+			done <- struct{}{}
+		}()
+	}
+	close(start)
+
+	timeout := time.After(5 * time.Second)
+	for range workers {
+		select {
+		case <-done:
+		case <-timeout:
+			t.Fatal("contending lock workers did not all make progress")
+		}
+	}
+	if want := workers * iterations; total != want {
+		t.Fatalf("protected total = %d, want %d", total, want)
+	}
+}
+
+func TestSpinlockUncontendedHasNoAllocations(t *testing.T) {
+	var lock spinlock
+	if allocs := testing.AllocsPerRun(1000, func() {
+		lock.lock()
+		lock.unlock()
+	}); allocs != 0 {
+		t.Fatalf("uncontended lock allocated %.2f times per acquisition", allocs)
+	}
+}
+
+// TestClearRange_AddressReuse verifies that allocator lifecycle clearing removes
+// only entries in the half-open range and gives a reused address fresh HB state.
+func TestClearRange_AddressReuse(t *testing.T) {
+	shadow := NewSyncShadow()
+	first := uintptr(0x1ff0)
+	size := uintptr(0x30) // Crosses an application-page boundary.
+	last := first + size - 1
+	outside := []uintptr{first - 1, last + 1}
+	inside := []uintptr{first, first + 7, 0x2000, last}
+
+	outsideStates := make([]*SyncVar, len(outside))
+	for i, addr := range outside {
+		outsideStates[i] = shadow.GetOrCreate(addr)
+	}
+	insideStates := make([]*SyncVar, len(inside))
+	clock := vectorclock.New()
+	clock.Set(3, 9)
+	for i, addr := range inside {
+		insideStates[i] = shadow.GetOrCreate(addr)
+		insideStates[i].SetReleaseClock(clock)
+	}
+
+	shadow.ClearRange(first, size)
+
+	for i, addr := range outside {
+		if !shadow.HasEntry(addr) {
+			t.Errorf("ClearRange removed out-of-range entry %#x", addr)
+		}
+		if got := shadow.GetOrCreate(addr); got != outsideStates[i] {
+			t.Errorf("ClearRange changed out-of-range SyncVar %#x", addr)
+		}
+	}
+	for i, addr := range inside {
+		if shadow.HasEntry(addr) {
+			t.Errorf("ClearRange retained stale entry %#x", addr)
+		}
+		fresh := shadow.GetOrCreate(addr)
+		if fresh == insideStates[i] {
+			t.Errorf("reused address %#x retained its old SyncVar", addr)
+		}
+		if fresh.GetReleaseClock() != nil {
+			t.Errorf("reused address %#x inherited a release clock", addr)
+		}
+	}
+}
+
+// TestClearRange_LargeSparseRange exercises the path which scans live page
+// records instead of walking every page in a large, mostly empty span.
+func TestClearRange_LargeSparseRange(t *testing.T) {
+	shadow := NewSyncShadow()
+	first := uintptr(0x1000)
+	lastPage := first + uintptr(syncDirectClearPages+1)*(1<<syncPageShift)
+	inside := []uintptr{first, first + 0x12345, lastPage + 17}
+	outside := lastPage + 1<<syncPageShift
+
+	for _, addr := range inside {
+		shadow.GetOrCreate(addr)
+	}
+	outsideState := shadow.GetOrCreate(outside)
+	shadow.ClearRange(first, lastPage+18-first)
+
+	for _, addr := range inside {
+		if shadow.HasEntry(addr) {
+			t.Errorf("large ClearRange retained entry %#x", addr)
+		}
+	}
+	if got := shadow.GetOrCreate(outside); got != outsideState {
+		t.Fatal("large ClearRange removed the first out-of-range entry")
+	}
+}
+
+func TestSyncShadowQuiescentCardinality(t *testing.T) {
+	shadow := NewSyncShadow()
+	addrs := []uintptr{0x1010, 0x1020, 0x1080, 0x2010}
+	for _, addr := range addrs {
+		shadow.GetOrCreate(addr)
+	}
+	if got := shadow.Stats(); got.LivePages != 2 || got.LiveEntries != 4 {
+		t.Fatalf("initial cardinality = %+v, want 2 pages and 4 entries", got)
+	}
+
+	shadow.ClearRange(0x1010, 0x18)
+	if got := shadow.Stats(); got.LivePages != 2 || got.LiveEntries != 2 {
+		t.Fatalf("partial-clear cardinality = %+v, want 2 pages and 2 entries", got)
+	}
+	shadow.ClearRange(0x1080, 1)
+	if got := shadow.Stats(); got.LivePages != 1 || got.LiveEntries != 1 {
+		t.Fatalf("page-clear cardinality = %+v, want 1 page and 1 entry", got)
+	}
+
+	shadow.Reset()
+	if got := shadow.Stats(); got.LivePages != 0 || got.LiveEntries != 0 {
+		t.Fatalf("reset cardinality = %+v, want empty", got)
+	}
+}
+
+func TestClearRangeHasNoAllocations(t *testing.T) {
+	const runs = 1000
+	shadow := NewSyncShadow()
+	const base = uintptr(0x100000)
+	for i := 0; i <= runs; i++ { // AllocsPerRun performs one warmup call.
+		shadow.GetOrCreate(base + uintptr(i)<<syncPageShift)
+	}
+
+	next := 0
+	if allocs := testing.AllocsPerRun(runs, func() {
+		shadow.ClearRange(base+uintptr(next)<<syncPageShift, 1)
+		next++
+	}); allocs != 0 {
+		t.Fatalf("ClearRange allocated %.2f times per populated page", allocs)
+	}
+	if got := shadow.Stats(); got.LivePages != 0 || got.LiveEntries != 0 {
+		t.Fatalf("clear-all cardinality = %+v, want empty", got)
+	}
+}
+
+func TestClearRangeRetainsReaderSnapshotObject(t *testing.T) {
+	shadow := NewSyncShadow()
+	addr := uintptr(0x1234)
+	want := shadow.GetOrCreate(addr)
+	clock := vectorclock.New()
+	clock.Set(7, 19)
+	want.SetReleaseClock(clock)
+
+	page := findPage(&shadow.buckets[fastHashSync(addr)], addr>>syncPageShift)
+	if page == nil {
+		t.Fatal("published page disappeared before its reader snapshot")
+	}
+	cell := page.segments[segmentIndex(addr)].Load()
+	if cell == nil || cell.addr != addr || cell.syncVar != want {
+		t.Fatal("published cell did not contain the initialized identity")
+	}
+
+	shadow.ClearRange(addr, 1)
+	runtime.GC()
+	if cell.addr != addr || cell.syncVar != want {
+		t.Fatal("removed cell changed while retained by a reader snapshot")
+	}
+	if got := cell.syncVar.GetReleaseClock(); got != nil {
+		t.Fatal("removed cell exposed synchronization state past its lifetime cut")
+	}
+	if fresh := shadow.GetOrCreate(addr); fresh == want {
+		t.Fatal("address reuse republished the removed identity")
+	}
+}
+
+// TestGetOrCreate_CachedHasNoAllocations protects the common sync lookup path.
+func TestGetOrCreate_CachedHasNoAllocations(t *testing.T) {
+	shadow := NewSyncShadow()
+	addr := uintptr(0x1234)
+	shadow.GetOrCreate(addr)
+
+	if allocs := testing.AllocsPerRun(1000, func() {
+		shadow.GetOrCreate(addr)
+	}); allocs != 0 {
+		t.Fatalf("cached GetOrCreate allocated %.2f times per lookup", allocs)
 	}
 }
 
@@ -127,6 +425,9 @@ func TestSyncVar_GetReleaseClock_Nil(t *testing.T) {
 	if clock != nil {
 		t.Error("Expected nil releaseClock on uninitialized SyncVar")
 	}
+	if joined := sv.JoinReleaseClock(vectorclock.New()); joined {
+		t.Fatal("JoinReleaseClock reported a release for an empty SyncVar")
+	}
 }
 
 // TestSyncVar_SetReleaseClock_First verifies first SetReleaseClock allocates.
@@ -140,6 +441,13 @@ func TestSyncVar_SetReleaseClock_First(t *testing.T) {
 
 	// First SetReleaseClock should allocate and copy.
 	sv.SetReleaseClock(vc)
+	joined := vectorclock.New()
+	if !sv.JoinReleaseClock(joined) {
+		t.Fatal("JoinReleaseClock did not report the published release")
+	}
+	if joined.Get(0) != 10 || joined.Get(1) != 20 {
+		t.Fatalf("joined release = {%d,%d}, want {10,20}", joined.Get(0), joined.Get(1))
+	}
 
 	// Verify releaseClock is now non-nil.
 	releaseClock := sv.GetReleaseClock()
@@ -161,7 +469,7 @@ func TestSyncVar_SetReleaseClock_First(t *testing.T) {
 	}
 }
 
-// TestSyncVar_SetReleaseClock_Update verifies subsequent SetReleaseClock updates in place.
+// TestSyncVar_SetReleaseClock_Update verifies subsequent SetReleaseClock replaces exactly.
 func TestSyncVar_SetReleaseClock_Update(t *testing.T) {
 	sv := &SyncVar{}
 
@@ -169,19 +477,12 @@ func TestSyncVar_SetReleaseClock_Update(t *testing.T) {
 	vc1 := vectorclock.New()
 	vc1.Set(0, 10)
 	sv.SetReleaseClock(vc1)
-	firstClock := sv.GetReleaseClock()
-
 	// Second SetReleaseClock with different values.
 	vc2 := vectorclock.New()
 	vc2.Set(0, 20)
 	vc2.Set(1, 30)
 	sv.SetReleaseClock(vc2)
 	secondClock := sv.GetReleaseClock()
-
-	// Verify same VectorClock instance (updated in place, no new allocation).
-	if firstClock != secondClock {
-		t.Error("SetReleaseClock allocated new clock instead of updating in place")
-	}
 
 	// Verify values were updated.
 	if secondClock.Get(0) != 20 {
@@ -289,406 +590,476 @@ func TestSyncVar_MergeReleaseClock_RWMutexScenario(t *testing.T) {
 	}
 }
 
-// === Channel State Tests (Phase 4 Task 4.2) ===
+func TestSyncVarConcurrentReleaseAcquireSeesCompleteClock(t *testing.T) {
+	var sv SyncVar
+	first := vectorclock.New()
+	first.Set(1, 11)
+	first.Set(1<<20, 101)
+	second := vectorclock.New()
+	second.Set(1, 22)
+	second.Set(1<<20, 202)
+	sv.SetReleaseClock(first)
 
-// TestSyncVar_GetOrCreateChannel verifies lazy channel state creation.
-func TestSyncVar_GetOrCreateChannel(t *testing.T) {
-	sv := &SyncVar{}
+	const iterations = 2000
+	start := make(chan struct{})
+	done := make(chan struct{}, 2)
+	go func() {
+		<-start
+		for i := 0; i < iterations; i++ {
+			if i&1 == 0 {
+				sv.SetReleaseClock(first)
+			} else {
+				sv.SetReleaseClock(second)
+			}
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		<-start
+		for i := 0; i < iterations; i++ {
+			acquired := vectorclock.New()
+			sv.JoinReleaseClock(acquired)
+			dense, sparse := acquired.Get(1), acquired.Get(1<<20)
+			if !((dense == 11 && sparse == 101) || (dense == 22 && sparse == 202)) {
+				t.Errorf("acquire observed partial release clock: dense=%d sparse=%d", dense, sparse)
+				break
+			}
+		}
+		done <- struct{}{}
+	}()
+	close(start)
+	<-done
+	<-done
+}
 
-	// Initially, GetChannel should return nil (not a channel).
-	if sv.GetChannel() != nil {
-		t.Error("Expected nil channel state before GetOrCreateChannel")
-	}
+func clocksEqual(left, right *vectorclock.VectorClock) bool {
+	return left != nil && right != nil && left.LessOrEqual(right) && right.LessOrEqual(left)
+}
 
-	// GetOrCreateChannel should create and return ChannelState.
-	chState1 := sv.GetOrCreateChannel()
-	if chState1 == nil {
-		t.Fatal("GetOrCreateChannel returned nil")
-	}
-
-	// Second call should return same instance.
-	chState2 := sv.GetOrCreateChannel()
-	if chState1 != chState2 {
-		t.Error("GetOrCreateChannel returned different instances")
-	}
-
-	// GetChannel should now return the created instance.
-	if sv.GetChannel() != chState1 {
-		t.Error("GetChannel returned different instance than GetOrCreateChannel")
+func requireClockEqual(t *testing.T, got, want *vectorclock.VectorClock) {
+	t.Helper()
+	if !clocksEqual(got, want) {
+		t.Fatalf("clock = %v, want %v", got, want)
 	}
 }
 
-// TestSyncVar_ChannelSendClock verifies send clock management.
-func TestSyncVar_ChannelSendClock(t *testing.T) {
-	sv := &SyncVar{}
-
-	// Initially, GetChannelSendClock should return nil.
-	if sv.GetChannelSendClock() != nil {
-		t.Error("Expected nil send clock before SetChannelSendClock")
+func TestSyncShadowGetExistingOwner(t *testing.T) {
+	shadow := NewSyncShadow()
+	addr := uintptr(0x2468)
+	if got := shadow.Get(addr); got != nil {
+		t.Fatalf("Get before publication = %p, want nil", got)
 	}
-
-	// Create a clock to set.
-	vc1 := vectorclock.New()
-	vc1.Set(0, 10)
-	vc1.Set(1, 20)
-
-	// SetChannelSendClock should capture the clock.
-	sv.SetChannelSendClock(vc1)
-
-	// Verify send clock was set.
-	sendClock := sv.GetChannelSendClock()
-	if sendClock == nil {
-		t.Fatal("SetChannelSendClock did not set send clock")
+	want := shadow.GetOrCreate(addr)
+	if got := shadow.Get(addr); got != want {
+		t.Fatalf("Get = %p, want existing owner %p", got, want)
 	}
-	if sendClock.Get(0) != 10 {
-		t.Errorf("Expected sendClock[0]=10, got %d", sendClock.Get(0))
+	if allocs := testing.AllocsPerRun(1000, func() { _ = shadow.Get(addr) }); allocs != 0 {
+		t.Fatalf("existing-owner Get allocated %.2f times", allocs)
 	}
-	if sendClock.Get(1) != 20 {
-		t.Errorf("Expected sendClock[1]=20, got %d", sendClock.Get(1))
+	shadow.ClearRange(addr, 1)
+	if got := shadow.Get(addr); got != nil {
+		t.Fatalf("Get after clear = %p, want nil", got)
 	}
-
-	// Verify it's a copy, not a reference.
-	if sendClock == vc1 {
-		t.Error("SetChannelSendClock did not copy, it's a reference")
-	}
-
-	// Update send clock with different values.
-	vc2 := vectorclock.New()
-	vc2.Set(0, 30)
-	vc2.Set(2, 40)
-	sv.SetChannelSendClock(vc2)
-
-	// Verify clock was updated in place.
-	sendClockUpdated := sv.GetChannelSendClock()
-	if sendClockUpdated != sendClock {
-		t.Error("SetChannelSendClock allocated new clock instead of updating in place")
-	}
-	if sendClockUpdated.Get(0) != 30 {
-		t.Errorf("Expected sendClock[0]=30, got %d", sendClockUpdated.Get(0))
-	}
-	if sendClockUpdated.Get(2) != 40 {
-		t.Errorf("Expected sendClock[2]=40, got %d", sendClockUpdated.Get(2))
+	if fresh := shadow.GetOrCreate(addr); fresh == want {
+		t.Fatal("cleared owner identity was revived")
 	}
 }
 
-// TestSyncVar_ChannelRecvClock verifies receive clock management.
-func TestSyncVar_ChannelRecvClock(t *testing.T) {
-	sv := &SyncVar{}
+func TestSyncVarTryOperationsMatchSerializedOracle(t *testing.T) {
+	var sv SyncVar
+	oracle := vectorclock.New()
 
-	// Initially, GetChannelRecvClock should return nil.
-	if sv.GetChannelRecvClock() != nil {
-		t.Error("Expected nil recv clock before SetChannelRecvClock")
+	first := vectorclock.New()
+	first.Set(1, 10)
+	first.Set(1<<20, 20)
+	first.RetireRange(1<<21, 1<<21+2)
+	sv.SetReleaseClock(first) // First publication is deliberately canonical.
+	oracle.CopyFrom(first)
+
+	for i := range sv.versions {
+		if sv.versions[i].clock == nil {
+			t.Fatalf("canonical first publication did not provision slot %d", i)
+		}
 	}
-
-	// Create a clock to set.
-	vc := vectorclock.New()
-	vc.Set(1, 15)
-
-	// SetChannelRecvClock should capture the clock.
-	sv.SetChannelRecvClock(vc)
-
-	// Verify recv clock was set.
-	recvClock := sv.GetChannelRecvClock()
-	if recvClock == nil {
-		t.Fatal("SetChannelRecvClock did not set recv clock")
+	check := func(event string) {
+		t.Helper()
+		requireClockEqual(t, sv.GetReleaseClock(), oracle)
+		acquired := oracle.Clone()
+		acquired.Reset() // Retain capacity while starting from the empty clock.
+		joined, ok := sv.TryJoinReleaseClock(acquired)
+		if !ok {
+			joined = sv.JoinReleaseClock(acquired)
+		}
+		if !joined {
+			t.Fatalf("%s: acquire reported no release", event)
+		}
+		requireClockEqual(t, acquired, oracle)
+		for i := range sv.versions {
+			if pins := sv.versions[i].pins.Load(); pins != 0 {
+				t.Fatalf("%s: slot %d retained %d pins", event, i, pins)
+			}
+		}
 	}
-	if recvClock.Get(1) != 15 {
-		t.Errorf("Expected recvClock[1]=15, got %d", recvClock.Get(1))
+	check("first set")
+
+	replacement := vectorclock.New()
+	replacement.Set(1, 11)
+	replacement.Set(1<<20, 19)
+	replacement.RetireRange(1<<21, 1<<21+2)
+	if !sv.TrySetReleaseClock(replacement) {
+		t.Fatal("warmed TrySetReleaseClock fell back")
+	}
+	oracle.CopyFrom(replacement)
+	check("try set")
+
+	merged := vectorclock.New()
+	merged.Set(2, 30)
+	merged.Set(1<<20, 25)
+	merged.RetireRange(1<<21+8, 1<<21+9)
+	if !sv.TryMergeReleaseClock(merged) {
+		sv.MergeReleaseClock(merged)
+	}
+	oracle.Join(merged)
+	check("try merge")
+}
+
+func TestSyncVarTryCapacityFailureIsSemanticallyAtomic(t *testing.T) {
+	var sv SyncVar
+	initial := vectorclock.New()
+	initial.Set(1, 1)
+	sv.SetReleaseClock(initial)
+
+	large := vectorclock.New()
+	for i := uint32(0); i < 256; i++ {
+		large.Set(1<<20+i*2, i+1)
+	}
+	before := sv.GetReleaseClock().Clone()
+	if sv.TrySetReleaseClock(large) {
+		t.Fatal("undersized reusable slot unexpectedly accepted capacity growth")
+	}
+	requireClockEqual(t, sv.GetReleaseClock(), before)
+
+	sv.SetReleaseClock(large)
+	requireClockEqual(t, sv.GetReleaseClock(), large)
+	if !sv.TrySetReleaseClock(large) {
+		t.Fatal("canonical capacity refresh did not warm a reusable slot")
 	}
 }
 
-// TestSyncVar_ChannelCloseClock verifies close clock management.
-func TestSyncVar_ChannelCloseClock(t *testing.T) {
-	sv := &SyncVar{}
-
-	// Initially, GetChannelCloseClock should return nil.
-	if sv.GetChannelCloseClock() != nil {
-		t.Error("Expected nil close clock before SetChannelCloseClock")
+func TestSyncVarTryAllSlotsPinnedFallsBackWithoutMutation(t *testing.T) {
+	var sv SyncVar
+	initial := vectorclock.New()
+	initial.Set(3, 7)
+	sv.SetReleaseClock(initial)
+	before := sv.GetReleaseClock().Clone()
+	for i := range sv.versions {
+		sv.versions[i].pins.Store(1)
 	}
 
-	// Initially, IsChannelClosed should return false.
-	if sv.IsChannelClosed() {
-		t.Error("Expected IsChannelClosed=false before close")
+	next := vectorclock.New()
+	next.Set(3, 8)
+	if sv.TrySetReleaseClock(next) {
+		t.Fatal("TrySetReleaseClock succeeded with every slot pinned")
 	}
+	requireClockEqual(t, sv.GetReleaseClock(), before)
 
-	// Create a clock to set.
-	vc := vectorclock.New()
-	vc.Set(0, 100)
-
-	// SetChannelCloseClock should capture the clock and mark as closed.
-	sv.SetChannelCloseClock(vc)
-
-	// Verify close clock was set.
-	closeClock := sv.GetChannelCloseClock()
-	if closeClock == nil {
-		t.Fatal("SetChannelCloseClock did not set close clock")
+	sv.SetReleaseClock(next)
+	requireClockEqual(t, sv.GetReleaseClock(), next)
+	if sv.current.Load() != nil {
+		t.Fatal("canonical fallback published a pinned slot")
 	}
-	if closeClock.Get(0) != 100 {
-		t.Errorf("Expected closeClock[0]=100, got %d", closeClock.Get(0))
-	}
-
-	// Verify isClosed flag was set.
-	if !sv.IsChannelClosed() {
-		t.Error("Expected IsChannelClosed=true after close")
-	}
-
-	// Verify it's a copy, not a reference.
-	if closeClock == vc {
-		t.Error("SetChannelCloseClock did not copy, it's a reference")
-	}
-
-	// Calling SetChannelCloseClock again should be idempotent (no panic).
-	vc2 := vectorclock.New()
-	vc2.Set(0, 200)
-	sv.SetChannelCloseClock(vc2)
-
-	// Close clock should NOT change (first close wins).
-	closeClock2 := sv.GetChannelCloseClock()
-	if closeClock2.Get(0) != 100 {
-		t.Errorf("Expected closeClock to remain 100, got %d", closeClock2.Get(0))
+	for i := range sv.versions {
+		sv.versions[i].pins.Store(0)
 	}
 }
 
-// TestSyncVar_ChannelState_Independent verifies channel and mutex state are independent.
-func TestSyncVar_ChannelState_Independent(t *testing.T) {
-	sv := &SyncVar{}
+func TestSyncVarGenerationExhaustionNeverRevivesVersion(t *testing.T) {
+	var sv SyncVar
+	initial := vectorclock.New()
+	initial.Set(4, 9)
+	sv.SetReleaseClock(initial)
+	sv.releaseMu.lock()
+	sv.nextGeneration = ^uint64(0)
+	sv.releaseMu.unlock()
 
-	// Set mutex release clock.
-	mutexClock := vectorclock.New()
-	mutexClock.Set(0, 10)
-	sv.SetReleaseClock(mutexClock)
-
-	// Set channel send clock.
-	chanClock := vectorclock.New()
-	chanClock.Set(1, 20)
-	sv.SetChannelSendClock(chanClock)
-
-	// Verify both are independent.
-	if sv.GetReleaseClock().Get(0) != 10 {
-		t.Error("Mutex release clock was affected by channel state")
+	next := vectorclock.New()
+	next.Set(4, 10)
+	if sv.TrySetReleaseClock(next) {
+		t.Fatal("TrySetReleaseClock wrapped its generation")
 	}
-	if sv.GetChannelSendClock().Get(1) != 20 {
-		t.Error("Channel send clock was affected by mutex state")
-	}
+	requireClockEqual(t, sv.GetReleaseClock(), initial)
 
-	// Verify they don't share memory.
-	if sv.GetReleaseClock() == sv.GetChannelSendClock() {
-		t.Error("Mutex and channel clocks share memory")
+	sv.SetReleaseClock(next)
+	requireClockEqual(t, sv.GetReleaseClock(), next)
+	if sv.current.Load() != nil {
+		t.Fatal("generation-exhausted canonical path revived a version")
+	}
+	if joined, ok := sv.TryJoinReleaseClock(vectorclock.New()); joined || ok {
+		t.Fatalf("TryJoinReleaseClock after exhaustion = (%v,%v), want false,false", joined, ok)
 	}
 }
 
-// === WaitGroup Tests (Phase 4 Task 4.3) ===
+func TestSyncVarClearRetiresStalePublication(t *testing.T) {
+	shadow := NewSyncShadow()
+	addr := uintptr(0x3456)
+	stale := shadow.GetOrCreate(addr)
+	release := vectorclock.New()
+	release.Set(9, 12)
+	stale.SetReleaseClock(release)
 
-// TestSyncVar_GetOrCreateWaitGroup verifies lazy WaitGroup state allocation.
-func TestSyncVar_GetOrCreateWaitGroup(t *testing.T) {
-	sv := &SyncVar{}
-
-	// Initially, GetWaitGroup should return nil.
-	if sv.GetWaitGroup() != nil {
-		t.Error("Expected nil WaitGroup before GetOrCreateWaitGroup")
+	shadow.ClearRange(addr, 1)
+	if stale.retired.Load() == 0 || stale.current.Load() != nil {
+		t.Fatal("clear did not retire and unpublish the stale owner")
 	}
-
-	// GetOrCreateWaitGroup should allocate WaitGroupState.
-	wgState := sv.GetOrCreateWaitGroup()
-	if wgState == nil {
-		t.Fatal("GetOrCreateWaitGroup returned nil")
+	if joined, ok := stale.TryJoinReleaseClock(vectorclock.New()); joined || ok {
+		t.Fatalf("stale TryJoinReleaseClock = (%v,%v), want false,false", joined, ok)
 	}
-
-	// Second call should return same instance (no new allocation).
-	wgState2 := sv.GetOrCreateWaitGroup()
-	if wgState != wgState2 {
-		t.Error("GetOrCreateWaitGroup created new instance instead of reusing")
+	if stale.TrySetReleaseClock(release) || stale.TryMergeReleaseClock(release) {
+		t.Fatal("stale owner published a new version")
 	}
-
-	// GetWaitGroup should now return the allocated state.
-	if sv.GetWaitGroup() != wgState {
-		t.Error("GetWaitGroup returned different instance")
+	if stale.GetReleaseClock() != nil || stale.JoinReleaseClock(vectorclock.New()) {
+		t.Fatal("stale canonical reader observed synchronization state")
 	}
-}
-
-// TestSyncVar_WaitGroupAdd verifies counter management.
-func TestSyncVar_WaitGroupAdd(t *testing.T) {
-	sv := &SyncVar{}
-
-	// Initially, counter should be 0.
-	if sv.GetWaitGroupCounter() != 0 {
-		t.Errorf("Expected counter=0, got %d", sv.GetWaitGroupCounter())
+	for i := range stale.versions {
+		if pins := stale.versions[i].pins.Load(); pins != 0 {
+			t.Fatalf("stale slot %d retained %d pins", i, pins)
+		}
 	}
-
-	// WaitGroupAdd(1) should increment counter to 1.
-	sv.WaitGroupAdd(1)
-	if sv.GetWaitGroupCounter() != 1 {
-		t.Errorf("Expected counter=1 after Add(1), got %d", sv.GetWaitGroupCounter())
-	}
-
-	// WaitGroupAdd(3) should increment counter to 4.
-	sv.WaitGroupAdd(3)
-	if sv.GetWaitGroupCounter() != 4 {
-		t.Errorf("Expected counter=4 after Add(3), got %d", sv.GetWaitGroupCounter())
-	}
-
-	// WaitGroupAdd(-1) should decrement counter to 3 (simulating Done).
-	sv.WaitGroupAdd(-1)
-	if sv.GetWaitGroupCounter() != 3 {
-		t.Errorf("Expected counter=3 after Add(-1), got %d", sv.GetWaitGroupCounter())
-	}
-
-	// Multiple Done() calls should bring counter back to 0.
-	sv.WaitGroupAdd(-1)
-	sv.WaitGroupAdd(-1)
-	sv.WaitGroupAdd(-1)
-	if sv.GetWaitGroupCounter() != 0 {
-		t.Errorf("Expected counter=0 after all Done(), got %d", sv.GetWaitGroupCounter())
+	if fresh := shadow.GetOrCreate(addr); fresh == stale {
+		t.Fatal("address reuse revived stale owner")
 	}
 }
 
-// TestSyncVar_MergeWaitGroupDoneClock verifies doneClock accumulation.
-func TestSyncVar_MergeWaitGroupDoneClock(t *testing.T) {
-	sv := &SyncVar{}
+func TestSyncVarTryOperationsHaveNoAllocations(t *testing.T) {
+	var sv SyncVar
+	left := vectorclock.New()
+	left.Set(1, 10)
+	left.Set(2, 20)
+	right := left.Clone()
+	right.Set(1, 11)
+	dst := vectorclock.New()
+	dst.CopyFrom(left)
+	sv.SetReleaseClock(left)
 
-	// Initially, GetWaitGroupDoneClock should return nil.
-	if sv.GetWaitGroupDoneClock() != nil {
-		t.Error("Expected nil doneClock before any Done()")
+	i := 0
+	if allocs := testing.AllocsPerRun(1000, func() {
+		src := left
+		if i&1 != 0 {
+			src = right
+		}
+		i++
+		if !sv.TrySetReleaseClock(src) {
+			t.Fatal("warmed TrySetReleaseClock fell back")
+		}
+	}); allocs != 0 {
+		t.Fatalf("TrySetReleaseClock allocated %.2f times", allocs)
 	}
-
-	// First Done() call - should copy the clock.
-	clock1 := vectorclock.New()
-	clock1.Set(0, 10)
-	clock1.Set(1, 5)
-	sv.MergeWaitGroupDoneClock(clock1)
-
-	doneClock := sv.GetWaitGroupDoneClock()
-	if doneClock == nil {
-		t.Fatal("MergeWaitGroupDoneClock did not set doneClock")
+	if allocs := testing.AllocsPerRun(1000, func() {
+		if joined, ok := sv.TryJoinReleaseClock(dst); !joined || !ok {
+			t.Fatal("warmed TryJoinReleaseClock fell back")
+		}
+	}); allocs != 0 {
+		t.Fatalf("TryJoinReleaseClock allocated %.2f times", allocs)
 	}
-	if doneClock.Get(0) != 10 || doneClock.Get(1) != 5 {
-		t.Errorf("Expected doneClock[0]=10, [1]=5, got [0]=%d, [1]=%d",
-			doneClock.Get(0), doneClock.Get(1))
-	}
-
-	// Verify it's a copy, not a reference.
-	if doneClock == clock1 {
-		t.Error("MergeWaitGroupDoneClock did not copy, it's a reference")
-	}
-
-	// Second Done() call - should merge (element-wise max).
-	clock2 := vectorclock.New()
-	clock2.Set(0, 8)  // Lower than 10 - should NOT update
-	clock2.Set(1, 12) // Higher than 5 - should update
-	clock2.Set(2, 7)  // New thread - should set
-	sv.MergeWaitGroupDoneClock(clock2)
-
-	doneClock = sv.GetWaitGroupDoneClock()
-	if doneClock.Get(0) != 10 {
-		t.Errorf("Expected doneClock[0]=10 (max(10,8)), got %d", doneClock.Get(0))
-	}
-	if doneClock.Get(1) != 12 {
-		t.Errorf("Expected doneClock[1]=12 (max(5,12)), got %d", doneClock.Get(1))
-	}
-	if doneClock.Get(2) != 7 {
-		t.Errorf("Expected doneClock[2]=7 (new thread), got %d", doneClock.Get(2))
-	}
-
-	// Third Done() call - verify continued accumulation.
-	clock3 := vectorclock.New()
-	clock3.Set(0, 20)
-	clock3.Set(3, 15)
-	sv.MergeWaitGroupDoneClock(clock3)
-
-	doneClock = sv.GetWaitGroupDoneClock()
-	if doneClock.Get(0) != 20 {
-		t.Errorf("Expected doneClock[0]=20 (max(10,20)), got %d", doneClock.Get(0))
-	}
-	if doneClock.Get(1) != 12 {
-		t.Errorf("Expected doneClock[1]=12 (unchanged), got %d", doneClock.Get(1))
-	}
-	if doneClock.Get(2) != 7 {
-		t.Errorf("Expected doneClock[2]=7 (unchanged), got %d", doneClock.Get(2))
-	}
-	if doneClock.Get(3) != 15 {
-		t.Errorf("Expected doneClock[3]=15 (new thread), got %d", doneClock.Get(3))
+	if allocs := testing.AllocsPerRun(1000, func() {
+		if !sv.TryMergeReleaseClock(left) {
+			sv.MergeReleaseClock(left)
+		}
+	}); allocs > 0.1 {
+		t.Fatalf("deferred TryMergeReleaseClock allocated %.2f times/op", allocs)
 	}
 }
 
-// TestSyncVar_WaitGroupState_Independent verifies WaitGroup state is independent.
-func TestSyncVar_WaitGroupState_Independent(t *testing.T) {
-	sv := &SyncVar{}
-
-	// Set mutex release clock.
-	mutexClock := vectorclock.New()
-	mutexClock.Set(0, 10)
-	sv.SetReleaseClock(mutexClock)
-
-	// Set channel send clock.
-	chanClock := vectorclock.New()
-	chanClock.Set(1, 20)
-	sv.SetChannelSendClock(chanClock)
-
-	// Set WaitGroup done clock.
-	wgClock := vectorclock.New()
-	wgClock.Set(2, 30)
-	sv.MergeWaitGroupDoneClock(wgClock)
-
-	// Verify all three are independent.
-	if sv.GetReleaseClock().Get(0) != 10 {
-		t.Error("Mutex release clock was affected by other state")
+func TestSyncVarSameSourceReleaseFoldsAndMaterializesExactly(t *testing.T) {
+	var sv SyncVar
+	const (
+		tid        = uint32(7)
+		foreignTID = uint32(41)
+		generation = uint64(9)
+	)
+	source := vectorclock.New()
+	source.Set(tid, 10)
+	source.Set(foreignTID, 3)
+	sv.SetReleaseClockForContext(source, tid, generation)
+	old := sv.current.Load()
+	if old == nil {
+		t.Fatal("canonical release did not publish a reusable version")
 	}
-	if sv.GetChannelSendClock().Get(1) != 20 {
-		t.Error("Channel send clock was affected by other state")
+	// Model a reader which sampled the preceding immutable version. Folding
+	// must invalidate its revalidation without mutating the pinned clock.
+	old.pins.Add(1)
+	source.Set(tid, 11)
+	if !sv.TrySetReleaseClockForContext(source, tid, generation) {
+		t.Fatal("same-source release did not fold")
 	}
-	if sv.GetWaitGroupDoneClock().Get(2) != 30 {
-		t.Error("WaitGroup done clock was affected by other state")
+	if !sv.folded || sv.current.Load() != nil {
+		t.Fatalf("folded state = (%v,%p), want (true,nil)", sv.folded, sv.current.Load())
+	}
+	if sv.current.Load() == old {
+		t.Fatal("old sampled publication remained authoritative")
+	}
+	old.pins.Add(-1)
+
+	// The source context already dominates its own release, so acquire is an
+	// exact no-op and leaves the scalar representation folded.
+	same := source.Clone()
+	if joined, ok := sv.TryJoinReleaseClockForContext(same, tid, generation); joined || !ok {
+		t.Fatalf("same-source acquire = (%v,%v), want (false,true)", joined, ok)
+	}
+	if !sv.folded {
+		t.Fatal("same-source acquire materialized the release")
 	}
 
-	// Verify they don't share memory.
-	if sv.GetReleaseClock() == sv.GetChannelSendClock() ||
-		sv.GetReleaseClock() == sv.GetWaitGroupDoneClock() ||
-		sv.GetChannelSendClock() == sv.GetWaitGroupDoneClock() {
-		t.Error("Different sync primitives share memory")
+	// A foreign source takes the canonical path and must see both the immutable
+	// base projection and the latest folded owner coordinate.
+	foreign := vectorclock.New()
+	if !sv.JoinReleaseClockForContext(foreign, tid+1, 1) {
+		t.Fatal("foreign acquire observed no release")
+	}
+	if got := foreign.Get(tid); got != 11 {
+		t.Fatalf("materialized owner clock = %d, want 11", got)
+	}
+	if got := foreign.Get(foreignTID); got != 3 {
+		t.Fatalf("materialized foreign clock = %d, want 3", got)
+	}
+	if sv.folded {
+		t.Fatal("foreign acquire left release folded")
 	}
 }
 
-// TestSyncVar_WaitGroupCounterAndClock verifies counter and clock are synchronized.
-func TestSyncVar_WaitGroupCounterAndClock(t *testing.T) {
-	sv := &SyncVar{}
+func TestSyncVarForeignGenerationChangeRejectsScalarFold(t *testing.T) {
+	var sv SyncVar
+	const tid, foreignTID = uint32(13), uint32(31)
+	source := vectorclock.New()
+	source.Set(tid, 4)
+	sv.SetReleaseClockForContext(source, tid, 2)
 
-	// Simulate typical WaitGroup usage pattern:
-	// Add(2) → Done() → Done()
+	// A detector-owned foreign import advances ForeignGeneration. The next Set
+	// must copy the complete new projection rather than reusing the old base.
+	source.Set(foreignTID, 17)
+	source.Set(tid, 5)
+	if !sv.TrySetReleaseClockForContext(source, tid, 3) {
+		t.Fatal("changed foreign projection did not use warmed exact publication")
+	}
+	if sv.folded {
+		t.Fatal("changed foreign projection was incorrectly folded")
+	}
+	got := sv.GetReleaseClock()
+	if got.Get(tid) != 5 || got.Get(foreignTID) != 17 {
+		t.Fatalf("release = {%d,%d}, want {5,17}", got.Get(tid), got.Get(foreignTID))
+	}
+}
 
-	// Parent: Add(2)
-	sv.WaitGroupAdd(2)
-	if sv.GetWaitGroupCounter() != 2 {
-		t.Errorf("Expected counter=2 after Add(2), got %d", sv.GetWaitGroupCounter())
+func TestSyncVarSameSourceFoldHasNoAllocations(t *testing.T) {
+	var sv SyncVar
+	const tid = uint32(17)
+	source := vectorclock.New()
+	source.Set(tid, 1)
+	sv.SetReleaseClockForContext(source, tid, 1)
+	if allocs := testing.AllocsPerRun(1000, func() {
+		if joined, ok := sv.TryJoinReleaseClockForContext(source, tid, 1); joined || !ok {
+			t.Fatal("same-source acquire fell back")
+		}
+		source.Set(tid, source.Get(tid)+1)
+		if !sv.TrySetReleaseClockForContext(source, tid, 1) {
+			t.Fatal("same-source release fell back")
+		}
+	}); allocs != 0 {
+		t.Fatalf("same-source folded cycle allocated %.2f times", allocs)
+	}
+}
+
+func TestSyncVarConcurrentTryAcquireReleasePublishesWholeVersions(t *testing.T) {
+	var sv SyncVar
+	first := vectorclock.New()
+	first.Set(5, 50)
+	first.Set(1<<20, 500)
+	second := vectorclock.New()
+	second.Set(5, 60)
+	second.Set(1<<20, 600)
+	sv.SetReleaseClock(first)
+
+	const iterations = 5000
+	start := make(chan struct{})
+	done := make(chan struct{}, 2)
+	go func() {
+		<-start
+		for i := 0; i < iterations; i++ {
+			src := first
+			if i&1 != 0 {
+				src = second
+			}
+			if !sv.TrySetReleaseClock(src) {
+				sv.SetReleaseClock(src)
+			}
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		<-start
+		for i := 0; i < iterations; i++ {
+			acquired := vectorclock.New()
+			joined, ok := sv.TryJoinReleaseClock(acquired)
+			if !ok {
+				joined = sv.JoinReleaseClock(acquired)
+			}
+			if !joined {
+				t.Error("acquire observed no release")
+				break
+			}
+			dense, sparse := acquired.Get(5), acquired.Get(1<<20)
+			if !((dense == 50 && sparse == 500) || (dense == 60 && sparse == 600)) {
+				t.Errorf("acquire observed partial version: dense=%d sparse=%d", dense, sparse)
+				break
+			}
+		}
+		done <- struct{}{}
+	}()
+	close(start)
+	<-done
+	<-done
+	for i := range sv.versions {
+		if pins := sv.versions[i].pins.Load(); pins != 0 {
+			t.Fatalf("slot %d retained %d pins", i, pins)
+		}
+	}
+}
+
+func TestSyncVarConcurrentTryMergePublishesExactUnion(t *testing.T) {
+	var sv SyncVar
+	initial := vectorclock.New()
+	initial.Set(1, 1)
+	sv.SetReleaseClock(initial)
+
+	const workers = 32
+	start := make(chan struct{})
+	done := make(chan struct{}, workers)
+	inputs := make([]*vectorclock.VectorClock, workers)
+	for i := range inputs {
+		clock := vectorclock.New()
+		clock.Set(uint32(i+2), uint32(100+i))
+		inputs[i] = clock
+		go func(clock *vectorclock.VectorClock) {
+			<-start
+			if !sv.TryMergeReleaseClock(clock) {
+				sv.MergeReleaseClock(clock)
+			}
+			done <- struct{}{}
+		}(clock)
+	}
+	close(start)
+	for range workers {
+		<-done
 	}
 
-	// Child 1: Done()
-	child1Clock := vectorclock.New()
-	child1Clock.Set(1, 10)
-	sv.MergeWaitGroupDoneClock(child1Clock)
-	sv.WaitGroupAdd(-1) // Done is Add(-1)
-
-	if sv.GetWaitGroupCounter() != 1 {
-		t.Errorf("Expected counter=1 after first Done(), got %d", sv.GetWaitGroupCounter())
+	oracle := initial.Clone()
+	for _, clock := range inputs {
+		oracle.Join(clock)
 	}
-	doneClock := sv.GetWaitGroupDoneClock()
-	if doneClock.Get(1) != 10 {
-		t.Errorf("Expected doneClock[1]=10, got %d", doneClock.Get(1))
+	requireClockEqual(t, sv.GetReleaseClock(), oracle)
+	for i := range sv.versions {
+		if pins := sv.versions[i].pins.Load(); pins != 0 {
+			t.Fatalf("slot %d retained %d pins", i, pins)
+		}
 	}
-
-	// Child 2: Done()
-	child2Clock := vectorclock.New()
-	child2Clock.Set(2, 15)
-	sv.MergeWaitGroupDoneClock(child2Clock)
-	sv.WaitGroupAdd(-1) // Done is Add(-1)
-
-	if sv.GetWaitGroupCounter() != 0 {
-		t.Errorf("Expected counter=0 after second Done(), got %d", sv.GetWaitGroupCounter())
-	}
-	doneClock = sv.GetWaitGroupDoneClock()
-	if doneClock.Get(1) != 10 || doneClock.Get(2) != 15 {
-		t.Errorf("Expected doneClock[1]=10, [2]=15, got [1]=%d, [2]=%d",
-			doneClock.Get(1), doneClock.Get(2))
-	}
-
-	// Counter=0 means Wait() can return, and waiter will merge doneClock.
 }

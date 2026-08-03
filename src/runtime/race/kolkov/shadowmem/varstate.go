@@ -7,10 +7,66 @@ package shadowmem
 
 import (
 	"internal/runtime/atomic"
+	"unsafe"
 
 	"runtime/race/kolkov/epoch"
 	"runtime/race/kolkov/vectorclock"
 )
+
+// CompactReadResult distinguishes an unsupported/unstable compact probe from
+// a completed mutation and from the only outcome safe to seed the redundant
+// read cache.
+type CompactReadResult uint8
+
+const (
+	CompactReadMiss CompactReadResult = iota
+	CompactReadHandled
+	CompactReadExactNoop
+)
+
+//go:linkname runtimeThrow runtime.throw
+func runtimeThrow(s string)
+
+//go:linkname runtimeKolkovSpinWait runtime.kolkovSpinWait
+func runtimeKolkovSpinWait(cycles uint32, yield bool)
+
+var nextLifecycleID atomic.Uint64
+
+// lifecycleID is a monotonically allocated shadow-object generation. Seven
+// bytes are sufficient for every realizable detector run and fit in the
+// alignment gap between readerCount and readClock, keeping VarState at its
+// 128-byte size class. It is immutable except while an otherwise unreachable
+// state is constructed or Reset is called under accessMu.
+type lifecycleID [7]byte
+
+const maxLifecycleID = uint64(1)<<56 - 1
+
+func allocateLifecycleID() lifecycleID {
+	id := nextLifecycleID.Add(1)
+	if id == 0 || id > maxLifecycleID {
+		runtimeThrow("race detector exhausted shadow lifecycle IDs")
+	}
+	return lifecycleID{
+		byte(id),
+		byte(id >> 8),
+		byte(id >> 16),
+		byte(id >> 24),
+		byte(id >> 32),
+		byte(id >> 40),
+		byte(id >> 48),
+	}
+}
+
+// uint64 expands the packed identity on the cold report path.
+func (id lifecycleID) uint64() uint64 {
+	return uint64(id[0]) |
+		uint64(id[1])<<8 |
+		uint64(id[2])<<16 |
+		uint64(id[3])<<24 |
+		uint64(id[4])<<32 |
+		uint64(id[5])<<40 |
+		uint64(id[6])<<48
+}
 
 // spinlock is a simple spinlock for runtime-compatible locking.
 // Uses atomic operations only, avoiding sync.Mutex dependency.
@@ -18,12 +74,28 @@ type spinlock struct {
 	state atomic.Uint32
 }
 
+// Keep the maximum pause short enough to react promptly to an unlock while
+// reducing cache-line traffic under contention. On g0 the runtime helper uses
+// bounded procyield; user-stack test callers may yield their goroutine at the
+// cap, while production g0 callers keep using procyield for these short locks.
+const spinlockMaxBackoff = uint32(64)
+
 //go:nosplit
 func (s *spinlock) lock() {
-	for !s.state.CompareAndSwap(0, 1) {
-		// Spin until we acquire the lock.
-		// In production, could add exponential backoff or yield.
+	for delay := uint32(1); ; {
+		if s.state.Load() == 0 && s.state.CompareAndSwap(0, 1) {
+			return
+		}
+		runtimeKolkovSpinWait(delay, delay == spinlockMaxBackoff)
+		if delay < spinlockMaxBackoff {
+			delay <<= 1
+		}
 	}
+}
+
+//go:nosplit
+func (s *spinlock) tryLock() bool {
+	return s.state.CompareAndSwap(0, 1)
 }
 
 //go:nosplit
@@ -47,50 +119,12 @@ const (
 	promotedMarker32 uint32 = 0xFF
 )
 
-// VarState stores the access state for a single variable using adaptive representation.
-//
-// ADAPTIVE REPRESENTATION (FastTrack Phase 3 optimization):
-//   - Common case: Exclusive access (one writer OR one reader)
-//   - Uses Epoch only (4 bytes for write + 4 bytes for read = 8 bytes)
-//   - O(1) operations, zero allocations
-//   - Conflict case: Shared reads or multiple writers
-//   - Promotes to VectorClock (1KB allocation for readClock)
-//   - O(N) operations, tracks all threads
-//
-// Promotion triggers:
-//   - OnRead: When second concurrent reader detected (readEpoch → readClock)
-//   - OnWrite: Write operations demote back to Epoch (readClock → nil)
-//
-// SMARTTRACK OWNERSHIP TRACKING (v0.2.0 Task 3 optimization):
-//   - Track exclusive writer TID to skip happens-before checks
-//   - Common case (80%): Single writer pattern (owned)
-//   - Fast path: No HB checks when reader == exclusive writer
-//   - Shared case (20%): Multiple writers (exclusiveWriter = -1)
-//   - Expected impact: 10-20% reduction in HB comparisons (PLDI 2020)
-//
-// Ownership states:
-//   - exclusiveWriter >= 0: Single owner (fast path, skip HB checks)
-//   - exclusiveWriter == -1: Shared/multiple writers (full FastTrack)
-//   - exclusiveWriter == 0: Uninitialized (no writes yet)
-//
-// Memory layout (v0.3.0 Enhanced Read-Shared + Lock-Free):
-//   - Base: 8 bytes (W atomic) + 8 bytes (mu) + 32 bytes (readEpochs[4]) + 1 byte (readerCount) + 8 bytes (readClock ptr) = 57 bytes
-//   - SmartTrack: + 8 bytes (exclusiveWriter atomic) + 4 bytes (writeCount) = 69 bytes
-//   - Stack Traces (Task 6): + 8 bytes (writeStackHash) + 8 bytes (readStackHash) = 85 bytes
-//   - Lazy PC capture: + 8 bytes (writePC atomic) + 8 bytes (readPC atomic) = 101 bytes
-//   - Total fast path: ~104 bytes per variable (with padding)
-//   - Promoted path: 104 bytes + 1024 bytes (VectorClock allocation) = 1128 bytes
-//
-// v0.3.0 ENHANCED READ-SHARED OPTIMIZATION (P1):
-// Trade-off: 88 bytes per variable (was 56 bytes) BUT avoids 1KB VectorClock allocation
-// for the common case of 2-4 concurrent readers. Most read-heavy patterns stay in
-// inline slots, saving 1KB per variable.
-//
-// Memory savings analysis:
-//   - Old approach: 2+ readers → 56 + 1024 = 1080 bytes
-//   - New approach: 2-4 readers → 88 bytes (no VectorClock)
-//   - New approach: 5+ readers → 88 + 1024 = 1112 bytes
-//   - Net savings for 2-4 readers: 992 bytes per variable!
+// VarState stores one exact ordinary-memory history. On 64-bit targets it is
+// deliberately 128 bytes, enforced by tests. A write epoch and up to four read
+// epochs stay inline; additional concurrent readers promote to a pooled vector
+// clock. accessMu linearizes detector transactions, while mu protects changes
+// to the adaptive read representation. The optional atomic state is detached
+// behind a pointer so ordinary histories retain the fixed size class.
 type VarState struct {
 	// Lock-free hot-path fields (atomic operations, no mutex needed):
 	// These fields are accessed on EVERY memory access, so lock-free is critical.
@@ -99,26 +133,36 @@ type VarState struct {
 	writePC         atomic.Uintptr // PC (program counter) of last write caller (8 bytes).
 	readPC          atomic.Uintptr // PC (program counter) of last read caller (8 bytes).
 
-	// Lock-free read tracking (v0.9.0 Quick Win 2):
-	// These atomic fields enable lock-free IsPromoted(), GetReadEpoch(), and SetReadEpoch()
-	// on the single-reader fast path, eliminating ~50ns of mutex overhead per access.
+	// Atomically published read-tracking discriminator and primary epoch.
+	// IsPromoted/GetReadEpoch remain lock-free; mutations are serialized by mu
+	// so promotion and demotion cannot lose a completed reader.
 	//
 	// Synchronization contract:
 	//   - readEpoch0 mirrors readEpochs[0] for lock-free reads on the fast path.
 	//   - readerState tracks reader count: 0=none, 1-4=inline count, 0xFF=promoted.
-	//   - Promotion: set readClock FIRST (under lock), then set readerState=promotedMarker32.
-	//   - Demotion: set readerState=0 FIRST, then clear readClock (under lock).
+	//   - Promotion: publish promoted state under mu after readClock contains
+	//     every completed reader, then retire readEpoch0.
+	//   - Demotion: retire readEpoch0/state and readClock together under mu.
 	//   - This ordering ensures IsPromoted()==true always implies readClock!=nil.
 	readEpoch0  atomic.Uint64 // Mirrors readEpochs[0] for lock-free single-reader fast path.
 	readerState atomic.Uint32 // 0=no readers, 1-4=inline count, 0xFF=promoted to VectorClock.
+
+	// accessMu linearizes a detector access's validation and publication. This
+	// is separate from mu so representation helpers can lock mu while the
+	// enclosing read or write transaction remains exclusive.
+	accessMu spinlock
 
 	// Spinlock-protected fields (complex operations):
 	// These are accessed less frequently or require complex multi-field updates.
 	mu spinlock // Protects read fields, readClock, and write counters from concurrent access.
 
-	// Read tracking (ENHANCED ADAPTIVE - v0.3.0 P1):
-	// Inline slots for up to 4 concurrent readers before VectorClock promotion.
-	// This delays expensive 1KB allocation for common patterns (2-4 readers).
+	// Keeping this diagnostic counter next to mu uses padding that would
+	// otherwise be lost and leaves room for the lazy atomic state without
+	// growing VarState.
+	writeCount uint32 // Number of writes (for statistics and debugging).
+
+	// Inline slots retain up to four concurrent readers before vector-clock
+	// promotion.
 	//
 	// States:
 	//   - readerCount == 0: No readers
@@ -128,17 +172,302 @@ type VarState struct {
 	// If readClock != nil → use readClock (5+ readers, promoted state)
 	readEpochs  [maxInlineReaders]epoch.Epoch // Inline reader slots (32 bytes = 4 × 8).
 	readerCount uint8                         // Number of inline readers (0-4, or 255 if promoted).
-	readClock   *vectorclock.VectorClock      // Multiple readers (promoted, 8 bytes pointer + 1KB allocation).
+	lifecycleID lifecycleID                   // Allocator generation, packed into readerCount's alignment gap.
+	readClock   *promotedReadFrontier         // Promoted actual-read event frontier (8-byte sidecar pointer).
 
-	// SmartTrack ownership tracking (v0.2.0 Task 3):
-	// Tracks exclusive writer to skip expensive happens-before checks.
-	writeCount uint32 // Number of writes (for statistics and debugging).
-
-	// Stack Trace Storage (v0.2.0 Task 6):
-	// Hash references to stack depot for previous write/read.
+	// Hash references to stack depot for the previous write/read.
 	// Enables complete race reports showing both current and previous stacks.
 	writeStackHash uint64 // Hash of stack trace for last write (8 bytes).
 	readStackHash  uint64 // Hash of stack trace for last read (8 bytes, only set when read-shared).
+
+	// atomicState points to a lazily allocated sidecar which owns the opaque
+	// detector history and the exact atomic-only transaction capability. Keeping
+	// the sidecar behind this existing GC-visible word avoids growing VarState or
+	// ShadowSlot. accessMu serializes attachment/reset and copy-on-write; cloned
+	// ordinary groups share the binding, whose detector lock serializes history.
+	atomicState atomic.Pointer[AtomicFastPath]
+}
+
+// ordinaryFastPlan is a prevalidated, allocation-free ordinary transition.
+// A successful plan retains vs.mu until finishOrdinaryFastPlan is called. The
+// enclosing PageTable transaction also retains accessMu, so every field in the
+// plan remains stable and a rejected plan has not changed semantic state.
+type ordinaryFastPlan struct {
+	before ordinaryFastHistory
+	after  ordinaryFastHistory
+}
+
+// ordinaryFastHistory is the exact allocation-free subset shared by compact
+// and materialized ordinary histories. It intentionally mirrors the canonical
+// transition fields rather than retaining representation-specific pointers.
+type ordinaryFastHistory struct {
+	write           epoch.Epoch
+	read            epoch.Epoch
+	exclusiveWriter int64
+	writePC         uintptr
+	readPC          uintptr
+	writeCount      uint32
+	lifecycle       lifecycleID
+}
+
+func ordinaryFastHappensBefore(e epoch.Epoch, clock *vectorclock.VectorClock) bool {
+	return e == 0 || clock != nil && e.HappensBefore(clock)
+}
+
+func (history ordinaryFastHistory) afterRead(current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr) (ordinaryFastHistory, bool) {
+	if current == 0 || !ordinaryFastHappensBefore(history.write, clock) {
+		return ordinaryFastHistory{}, false
+	}
+	next := history
+	next.readPC = pc
+	if history.read == current {
+		return next, true
+	}
+	if history.read == 0 {
+		next.read = current
+		return next, true
+	}
+	existingTID, _ := history.read.Decode()
+	currentTID, _ := current.Decode()
+	if existingTID == currentTID || ordinaryFastHappensBefore(history.read, clock) {
+		next.read = current
+		return next, true
+	}
+	return ordinaryFastHistory{}, false
+}
+
+func (history ordinaryFastHistory) afterWrite(current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr) (ordinaryFastHistory, bool) {
+	if current == 0 || !ordinaryFastHappensBefore(history.write, clock) ||
+		!ordinaryFastHappensBefore(history.read, clock) {
+		return ordinaryFastHistory{}, false
+	}
+	next := history
+	if history.write == current && history.read == 0 {
+		next.writePC = pc
+		return next, true
+	}
+	currentTID, _ := current.Decode()
+	if next.exclusiveWriter == 0 {
+		next.exclusiveWriter = int64(currentTID)
+	} else if next.exclusiveWriter > 0 && next.exclusiveWriter != int64(currentTID) {
+		next.exclusiveWriter = -1
+	}
+	next.write = current
+	next.writeCount++
+	next.writePC = pc
+	next.read = 0
+	return next, true
+}
+
+// tryOrdinaryFastPlan proves the simple, non-promoted subset of the canonical
+// FastTrack transition without changing history. The optional expected
+// descriptor binds a compact membership to its exact immutable publication.
+// Returning true transfers ownership of vs.mu to the caller.
+func (vs *VarState) tryOrdinaryFastPlan(current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr, write bool, expected *ordinaryFastHistory) (ordinaryFastPlan, bool) {
+	if current == 0 || vs.atomicState.Load() != nil || !vs.mu.tryLock() {
+		return ordinaryFastPlan{}, false
+	}
+
+	// The optimistic path never allocates. Multi-reader and promoted histories
+	// may require promotion, clock pruning, or pooled-clock release, so leave
+	// them to the canonical transaction.
+	if vs.readClock != nil || vs.readerCount > 1 ||
+		vs.readerState.Load() != uint32(vs.readerCount) {
+		vs.mu.unlock()
+		return ordinaryFastPlan{}, false
+	}
+
+	read := epoch.Epoch(0)
+	switch vs.readerCount {
+	case 0:
+		if vs.readEpoch0.Load() != 0 {
+			vs.mu.unlock()
+			return ordinaryFastPlan{}, false
+		}
+	case 1:
+		read = epoch.Epoch(vs.readEpoch0.Load())
+		if read == 0 || vs.readEpochs[0] != read {
+			vs.mu.unlock()
+			return ordinaryFastPlan{}, false
+		}
+	default:
+		vs.mu.unlock()
+		return ordinaryFastPlan{}, false
+	}
+	for i := int(vs.readerCount); i < len(vs.readEpochs); i++ {
+		if vs.readEpochs[i] != 0 {
+			vs.mu.unlock()
+			return ordinaryFastPlan{}, false
+		}
+	}
+
+	writeEpoch := epoch.Epoch(vs.W.Load())
+	owner := vs.exclusiveWriter.Load()
+	if owner < -1 || writeEpoch == 0 &&
+		(owner != 0 || vs.writeCount != 0 || vs.writePC.Load() != 0) {
+		vs.mu.unlock()
+		return ordinaryFastPlan{}, false
+	}
+	if writeEpoch != 0 && owner >= 0 {
+		writeTID, _ := writeEpoch.Decode()
+		if owner != int64(writeTID) {
+			vs.mu.unlock()
+			return ordinaryFastPlan{}, false
+		}
+	}
+
+	plan := ordinaryFastPlan{before: ordinaryFastHistory{
+		write:           writeEpoch,
+		read:            read,
+		exclusiveWriter: owner,
+		writePC:         vs.writePC.Load(),
+		readPC:          vs.readPC.Load(),
+		writeCount:      vs.writeCount,
+		lifecycle:       vs.lifecycleID,
+	}}
+	if expected != nil {
+		// Compact descriptors deliberately exclude side metadata. A state with
+		// stack metadata cannot be the exact compact publication it claims to be.
+		if vs.writeStackHash != 0 || vs.readStackHash != 0 || plan.before != *expected {
+			vs.mu.unlock()
+			return ordinaryFastPlan{}, false
+		}
+	}
+
+	next := ordinaryFastHistory{}
+	var ok bool
+	if write {
+		next, ok = plan.before.afterWrite(current, clock, pc)
+	} else {
+		next, ok = plan.before.afterRead(current, clock, pc)
+	}
+	if !ok || vs.atomicState.Load() != nil || vs.lifecycleID != plan.before.lifecycle {
+		vs.mu.unlock()
+		return ordinaryFastPlan{}, false
+	}
+	plan.after = next
+	return plan, true
+}
+
+// finishOrdinaryFastPlan commits a previously proved plan and releases vs.mu.
+// Passing commit=false is an unchanged semantic miss.
+func (vs *VarState) finishOrdinaryFastPlan(plan ordinaryFastPlan, commit bool) {
+	if commit {
+		next := plan.after
+		vs.W.Store(uint64(next.write))
+		vs.exclusiveWriter.Store(next.exclusiveWriter)
+		vs.writePC.Store(next.writePC)
+		vs.readPC.Store(next.readPC)
+		vs.writeCount = next.writeCount
+		for i := range vs.readEpochs {
+			vs.readEpochs[i] = 0
+		}
+		if next.read == 0 {
+			vs.readerCount = 0
+			vs.readEpoch0.Store(0)
+			vs.readerState.Store(0)
+		} else {
+			vs.readerCount = 1
+			vs.readEpochs[0] = next.read
+			vs.readEpoch0.Store(uint64(next.read))
+			vs.readerState.Store(1)
+		}
+	}
+	vs.mu.unlock()
+}
+
+// LockAccess starts one linearized detector access to this exact address.
+//
+//go:nosplit
+func (vs *VarState) LockAccess() {
+	vs.accessMu.lock()
+}
+
+// TryLockAccess starts a linearized detector access without waiting.
+//
+//go:nosplit
+func (vs *VarState) TryLockAccess() bool {
+	return vs.accessMu.tryLock()
+}
+
+// UnlockAccess completes an access started by LockAccess.
+//
+//go:nosplit
+func (vs *VarState) UnlockAccess() {
+	vs.accessMu.unlock()
+}
+
+// ClosePromotedReadFrontier permanently excludes lock-free promoted reads
+// before an exclusive mutation. It is idempotent and allocation-free.
+//
+//go:nosplit
+func (vs *VarState) ClosePromotedReadFrontier() {
+	if frontier := vs.readClock; frontier != nil {
+		frontier.close()
+	}
+}
+
+// GetAtomicState returns the opaque detector-owned history in the current
+// sidecar. Callers that dereference the result must hold the access lock or a
+// retained, revalidated AtomicFastPath transaction.
+//
+//go:nosplit
+func (vs *VarState) GetAtomicState() unsafe.Pointer {
+	binding := vs.atomicState.Load()
+	if binding == nil {
+		return nil
+	}
+	return binding.overlay
+}
+
+// SetAtomicState publishes a new sidecar for opaque detector-owned history.
+// The caller must hold the access lock and must have escaped any mapped fast
+// capability through its ShadowSlot protocol.
+func (vs *VarState) SetAtomicState(state unsafe.Pointer) {
+	vs.SetAtomicStateOwned(state, nil, nil)
+}
+
+// SetAtomicStateOwned publishes detector-owned sidecar state together with the
+// exact ownership callbacks for its typed arena slot. Each VarState attachment
+// owns one reference, including copy-on-write clones; replacement retains the
+// new sidecar before releasing the drained old binding so rebinding the same
+// overlay cannot transiently retire it.
+func (vs *VarState) SetAtomicStateOwned(state unsafe.Pointer, retain, release func(unsafe.Pointer)) {
+	if state == nil {
+		runtimeThrow("race detector cannot publish a nil atomic sidecar")
+	}
+	vs.ClosePromotedReadFrontier()
+	if retain != nil {
+		retain(state)
+	}
+	if binding := vs.atomicState.Load(); binding != nil {
+		binding.escapeIncompatible()
+		vs.atomicState.Store(nil)
+		if binding.releaseOverlay != nil {
+			binding.releaseOverlay(binding.overlay)
+		}
+	}
+	vs.atomicState.Store(&AtomicFastPath{
+		overlay: state, retainOverlay: retain, releaseOverlay: release,
+	})
+}
+
+// DetachAtomicStateLocked drops this VarState's ownership after its last shadow
+// slot membership has been removed. The caller holds accessMu. Closing the
+// binding first drains every retained fast capability, while accessMu itself
+// drains slow transactions; the release callback may therefore reclaim all
+// sidecar metadata immediately.
+func (vs *VarState) DetachAtomicStateLocked() {
+	vs.ClosePromotedReadFrontier()
+	binding := vs.atomicState.Load()
+	if binding == nil {
+		return
+	}
+	binding.escapeIncompatible()
+	vs.atomicState.Store(nil)
+	if binding.releaseOverlay != nil {
+		binding.releaseOverlay(binding.overlay)
+	}
 }
 
 // NewVarState creates a new zero-initialized variable state.
@@ -148,7 +477,55 @@ type VarState struct {
 //
 //go:nosplit
 func NewVarState() *VarState {
-	return &VarState{}
+	return &VarState{lifecycleID: allocateLifecycleID()}
+}
+
+// CloneOrdinaryLocked returns a deep copy of all ordinary FastTrack state.
+// The caller must hold vs's access lock, which stabilizes both the atomic
+// fields and the representation protected by mu.
+//
+// The detector-owned atomic overlay is shared, not duplicated. Its own lock
+// protects width-aware per-lane history, so copy-on-write ordinary groups can
+// safely retain the same overlay while their FastTrack histories diverge.
+func (vs *VarState) CloneOrdinaryLocked() *VarState {
+	// Copy-on-write is an exclusive representation mutation. Close before
+	// snapshotting so every stable node is included and every odd publisher is
+	// forced to retry against the post-COW mapping.
+	vs.ClosePromotedReadFrontier()
+	clone := &VarState{lifecycleID: vs.lifecycleID}
+	clone.W.Store(vs.W.Load())
+	clone.exclusiveWriter.Store(vs.exclusiveWriter.Load())
+	clone.writePC.Store(vs.writePC.Load())
+	clone.readPC.Store(vs.readPC.Load())
+	clone.readEpoch0.Store(vs.readEpoch0.Load())
+	clone.readerState.Store(vs.readerState.Load())
+	binding := vs.atomicState.Load()
+	if binding != nil && binding.retainOverlay != nil {
+		binding.retainOverlay(binding.overlay)
+	}
+	clone.atomicState.Store(binding)
+
+	vs.mu.lock()
+	clone.writeCount = vs.writeCount
+	clone.readEpochs = vs.readEpochs
+	clone.readerCount = vs.readerCount
+	if vs.readClock != nil {
+		vs.readClock.refreshLegacyLocked()
+		clone.readClock = newPromotedReadFrontier(vs.readClock.legacy.Clone(), clone.GetLifecycleID())
+		clone.readClock.close()
+	}
+	clone.writeStackHash = vs.writeStackHash
+	clone.readStackHash = vs.readStackHash
+	vs.mu.unlock()
+
+	return clone
+}
+
+// GetLifecycleID returns the immutable allocator-lifetime identity represented
+// by this state. Callers that snapshot a state for deferred reporting retain it
+// alongside the access metadata.
+func (vs *VarState) GetLifecycleID() uint64 {
+	return vs.lifecycleID.uint64()
 }
 
 // Reset resets the variable state to zero.
@@ -157,43 +534,44 @@ func NewVarState() *VarState {
 // After Reset(), the state represents a fresh, never-accessed variable.
 // If promoted, this demotes back to fast path (releases VectorClock to pool).
 //
-// SmartTrack (v0.2.0 Task 3): Also resets ownership tracking fields.
-// Stack Traces (v0.2.0 Task 6): Also clears stack hashes.
-// Enhanced Read-Shared (v0.3.0 P1): Also clears all inline reader slots.
-// Lazy Stack Capture (v0.3.0 Performance): Also clears PC fields.
-// Pooling: Returns VectorClock to pool for reuse if promoted.
-//
-// Performance: This operation must be zero-allocation and inline-friendly.
-// Target: <5ns/op (was <2ns, increased due to clearing 4 slots).
-//
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
+// Reset also clears ownership, stack, PC, inline-reader, and atomic sidecar
+// state. A promoted vector clock is returned to its pool.
 func (vs *VarState) Reset() {
+	vs.LockAccess()
+	defer vs.UnlockAccess()
+	vs.ClosePromotedReadFrontier()
+	// A retained atomic capability does not hold accessMu. Close and drain it
+	// before changing any ordinary field, detector overlay, or lifecycle byte so
+	// fast completion observes either the complete old generation or the
+	// complete reset generation, never a mixture of both.
+	vs.DetachAtomicStateLocked()
+
 	// Reset lock-free fields using atomic stores.
 	vs.W.Store(0)
 	vs.exclusiveWriter.Store(0)
 	vs.writePC.Store(0)
 	vs.readPC.Store(0)
 
-	// Ordering contract for demotion: set readerState=0 FIRST, then clear readClock.
-	vs.readerState.Store(0)
-	vs.readEpoch0.Store(0)
-
 	// Reset mutex-protected fields.
 	vs.mu.lock()
+	vs.readerState.Store(0)
+	vs.readEpoch0.Store(0)
 	// Release VectorClock back to pool if promoted.
-	if vs.readClock != nil {
-		vs.readClock.Release()
+	if vs.readClock != nil && vs.readClock.legacy != nil {
+		vs.readClock.legacy.Release()
 	}
 	// Clear all inline reader slots.
 	for i := range vs.readEpochs {
 		vs.readEpochs[i] = 0
 	}
 	vs.readerCount = 0
-	vs.readClock = nil // Demote if promoted.
+	vs.readClock = nil
 	vs.writeCount = 0
 	vs.writeStackHash = 0
 	vs.readStackHash = 0
 	vs.mu.unlock()
+
+	vs.lifecycleID = allocateLifecycleID()
 }
 
 // IsPromoted returns true if VarState uses VectorClock (promoted state).
@@ -202,7 +580,6 @@ func (vs *VarState) Reset() {
 //   - false: Fast path (inline reader slots, up to 4 readers, 32 bytes)
 //   - true: Slow path (readClock, 5+ readers, 1KB allocation)
 //
-// v0.9.0 Lock-Free: Uses atomic readerState instead of mutex.
 // The promotion/demotion ordering contract guarantees that when
 // readerState==promotedMarker32, readClock is non-nil.
 //
@@ -213,46 +590,57 @@ func (vs *VarState) IsPromoted() bool {
 
 // PromoteToReadClock upgrades from inline reader slots to multi-reader VectorClock.
 //
-// v0.3.0 Enhanced Read-Shared: This now happens when:
-//   - All 4 inline reader slots are full
-//   - A 5th concurrent reader is detected
+// Promotion happens when all four inline reader slots are full and another
+// concurrent reader must be represented.
 //
 // Steps:
 //  1. Allocate VectorClock from pool (one-time cost, reused allocation)
 //  2. Copy ALL inline reader epochs into VectorClock
-//  3. Merge new read VectorClock
-//  4. Set readerCount = promotedMarker (marks as promoted)
+//  3. Discard read events ordered before the new reader
+//  4. Record the new reader's epoch
+//  5. Set readerCount = promotedMarker (marks as promoted)
 //
 // After promotion, all subsequent reads use VectorClock path.
 //
-// Performance: This is a one-time cost (~100ns allocation + copy).
-// Now even rarer than before (only 5+ concurrent readers trigger this).
-// Uses pooled allocation to reduce GC pressure.
+// The vector clock is obtained from the pool.
 //
 // Parameters:
-//   - newReadVC: The VectorClock of the new concurrent reader
-func (vs *VarState) PromoteToReadClock(newReadVC *vectorclock.VectorClock) {
+//   - current: The epoch of the new concurrent reader
+//   - observed: The new reader's causal clock, used only to prune old events
+func (vs *VarState) PromoteToReadClock(current epoch.Epoch, observed *vectorclock.VectorClock) {
 	vs.mu.lock()
+	defer vs.mu.unlock()
 
-	// Sync slot 0 from atomic mirror before copying to VectorClock.
+	// Another reader may have completed promotion while this caller waited.
+	// Record only this completed read in the already-published event set.
+	if vs.readerCount == promotedMarker {
+		recordPromotedRead(vs.readClock.legacy, current, observed)
+		return
+	}
+
+	// Slot 0 is published atomically for lock-free readers and mirrored under
+	// this same lock by SetReadEpoch/AddReader.
 	if vs.readerCount > 0 {
 		vs.readEpochs[0] = epoch.Epoch(vs.readEpoch0.Load())
 	}
 
 	// Allocate VectorClock from pool for promoted read tracking.
-	vs.readClock = vectorclock.NewFromPool()
+	vs.readClock = newPromotedReadFrontier(vectorclock.NewFromPool(), vs.GetLifecycleID())
 
 	// Copy ALL inline reader epochs into VectorClock.
 	for i := uint8(0); i < vs.readerCount && i < maxInlineReaders; i++ {
 		if vs.readEpochs[i] != 0 {
 			tid, clock := vs.readEpochs[i].Decode()
 			//nolint:gosec // G115: Epoch clock is uint64, but per-thread VectorClock uses uint32 (safe truncation).
-			vs.readClock.Set(tid, uint32(clock))
+			vs.readClock.legacy.Set(tid, uint32(clock))
 		}
 	}
 
-	// Merge the new reader's VectorClock.
-	vs.readClock.Join(newReadVC)
+	// readClock is an event set, not a causal VectorClock snapshot. Recording
+	// the reader's full causal clock would manufacture reads by every thread
+	// that this reader has merely observed.
+	pruneObservedReadEvents(vs.readClock.legacy, observed)
+	setReadClockEpoch(vs.readClock.legacy, current)
 
 	// Clear inline slots and mark as promoted.
 	for i := range vs.readEpochs {
@@ -260,18 +648,58 @@ func (vs *VarState) PromoteToReadClock(newReadVC *vectorclock.VectorClock) {
 	}
 	vs.readerCount = promotedMarker
 
-	vs.mu.unlock()
-
-	// Ordering contract: set readClock FIRST (under lock above), then set readerState.
-	// This ensures IsPromoted()==true always implies readClock!=nil.
-	vs.readEpoch0.Store(0)
+	// Publish the discriminator last, while still holding the writer lock. Any
+	// SetReadEpoch racing with this transition rechecks readerCount under the
+	// lock and joins readClock instead of reviving the inline representation.
 	vs.readerState.Store(promotedMarker32)
+	vs.readEpoch0.Store(0)
+}
+
+// pruneObservedReadEvents drops actual read events dominated by observed in
+// one pass. It never imports observed coordinates into the event set.
+func pruneObservedReadEvents(readClock, observed *vectorclock.VectorClock) {
+	if readClock == nil || observed == nil {
+		return
+	}
+	readClock.PruneEventSetLessOrEqual(observed)
+}
+
+func setReadClockEpoch(readClock *vectorclock.VectorClock, read epoch.Epoch) {
+	if readClock == nil || read == 0 {
+		return
+	}
+	tid, clock := read.Decode()
+	//nolint:gosec // Epoch clocks intentionally use the VectorClock's uint32 representation.
+	readClock.Set(tid, uint32(clock))
+}
+
+// recordPromotedRead maintains the promoted read-event frontier. If this
+// logical thread already has a witness, program order places that witness
+// before current. Replacing it is therefore exact: any future write which has
+// observed current has also observed the old witness, and any write which has
+// not observed current can use current itself as the conflict witness.
+//
+// Pruning other observed readers is only frontier compaction. Retaining those
+// real, HB-dominated reads cannot hide a race, so defer the O(frontier) scan
+// until a new logical thread must be inserted.
+func recordPromotedRead(readClock *vectorclock.VectorClock, current epoch.Epoch, observed *vectorclock.VectorClock) {
+	if readClock == nil || current == 0 {
+		return
+	}
+	tid, clock := current.Decode()
+	if readClock.Get(tid) != 0 {
+		//nolint:gosec // Epoch clocks intentionally use the VectorClock's uint32 representation.
+		readClock.Set(tid, uint32(clock))
+		return
+	}
+	pruneObservedReadEvents(readClock, observed)
+	//nolint:gosec // Epoch clocks intentionally use the VectorClock's uint32 representation.
+	readClock.Set(tid, uint32(clock))
 }
 
 // GetReadEpoch returns the first read epoch (backward compatibility).
 //
-// v0.9.0 Lock-Free: Reads from atomic readEpoch0 field, no mutex needed.
-// For single reader (common case, 90%+ of accesses), this is the fast path.
+// The first reader is published through atomic readEpoch0.
 // For multiple readers, use GetReadEpochs() to get all inline readers.
 //
 // PRECONDITION: !IsPromoted() - caller must check this first.
@@ -288,15 +716,30 @@ func (vs *VarState) GetReadEpoch() epoch.Epoch {
 	return 0
 }
 
-// GetReadEpochs returns all inline reader epochs (v0.3.0 Enhanced Read-Shared).
+// ReadPCForEpoch returns the PC for e only when the ordinary read history has
+// one represented reader. VarState stores one aggregate read PC, so after
+// inline sharing or promotion it cannot safely attribute that PC to a specific
+// conflicting epoch. Callers must treat ok=false as unknown rather than using
+// the aggregate PC for suppression decisions.
+func (vs *VarState) ReadPCForEpoch(e epoch.Epoch) (pc uintptr, ok bool) {
+	if e == 0 {
+		return 0, false
+	}
+	vs.mu.lock()
+	if vs.readerCount == 1 && epoch.Epoch(vs.readEpoch0.Load()) == e {
+		pc, ok = vs.readPC.Load(), true
+	}
+	vs.mu.unlock()
+	return pc, ok
+}
+
+// GetReadEpochs returns all inline reader epochs.
 //
 // PRECONDITION: !IsPromoted() - caller must check this first.
 // If promoted, this returns nil.
 //
 // Returns a slice of all active reader epochs (0 to 4 elements).
 // The caller should check all epochs for happens-before relationships.
-//
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
 func (vs *VarState) GetReadEpochs() []epoch.Epoch {
 	vs.mu.lock()
 	defer vs.mu.unlock()
@@ -315,14 +758,12 @@ func (vs *VarState) GetReadEpochs() []epoch.Epoch {
 	return result
 }
 
-// GetReaderCount returns the number of inline readers (v0.3.0 Enhanced Read-Shared).
+// GetReaderCount returns the number of inline readers.
 //
 // Returns:
 //   - 0: No readers
 //   - 1-4: Number of inline readers
 //   - 255 (promotedMarker): Promoted to VectorClock
-//
-// v0.9.0 Lock-Free: Uses atomic readerState instead of mutex.
 //
 //go:nosplit
 func (vs *VarState) GetReaderCount() uint8 {
@@ -331,26 +772,32 @@ func (vs *VarState) GetReaderCount() uint8 {
 
 // SetReadEpoch sets the read epoch for single-reader fast path.
 //
-// v0.9.0 Lock-Free: Fully atomic, no spinlock. Updates readEpoch0 and
-// readerState atomically. The readEpochs[0] backing field is synced lazily
-// in AddReader when a second reader appears (rare path).
+// Reader publication is serialized with promotion and demotion so a completed
+// read cannot be lost while the adaptive representation changes. Repeated reads
+// are eliminated by the owning RaceContext before reaching this method.
 //
-// This is the HOT PATH for OnRead — called on every single-reader access.
-// If already promoted, this is a no-op (readClock takes precedence).
-//
-//go:nosplit
+// This runs only when per-context redundant-read elimination misses. If the
+// state is already promoted, the reader is recorded directly in readClock.
 func (vs *VarState) SetReadEpoch(e epoch.Epoch) {
-	if vs.readerState.Load() == promotedMarker32 {
-		return // Promoted, no-op.
+	vs.mu.lock()
+	defer vs.mu.unlock()
+
+	if vs.readerCount == promotedMarker {
+		// A reader racing with promotion must join the published read clock,
+		// rather than writing the retired inline mirror.
+		setReadClockEpoch(vs.readClock.legacy, e)
+		return
 	}
-	// Fully atomic update — no spinlock needed for single-reader case.
+
 	vs.readEpoch0.Store(uint64(e))
-	if vs.readerState.Load() == 0 {
-		vs.readerState.Store(1)
+	vs.readEpochs[0] = e
+	if vs.readerCount == 0 {
+		vs.readerCount = 1
 	}
+	vs.readerState.Store(uint32(vs.readerCount))
 }
 
-// AddReader adds or updates a reader in the inline slots (v0.3.0 Enhanced Read-Shared).
+// AddReader adds or updates a reader in the inline slots.
 //
 // Logic:
 //  1. If TID already exists in slots → update that slot's epoch
@@ -362,8 +809,6 @@ func (vs *VarState) SetReadEpoch(e epoch.Epoch) {
 //   - false: Slots are full, promotion to VectorClock needed
 //
 // If already promoted, this is a no-op and returns true.
-//
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
 func (vs *VarState) AddReader(e epoch.Epoch) bool {
 	vs.mu.lock()
 	defer vs.mu.unlock()
@@ -414,8 +859,6 @@ func (vs *VarState) AddReader(e epoch.Epoch) bool {
 
 // HasInlineSlot returns true if there's room for another inline reader.
 //
-// v0.9.0 Lock-Free: Uses atomic readerState instead of mutex.
-//
 //go:nosplit
 func (vs *VarState) HasInlineSlot() bool {
 	state := vs.readerState.Load()
@@ -430,33 +873,154 @@ func (vs *VarState) HasInlineSlot() bool {
 // Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
 func (vs *VarState) GetReadClock() *vectorclock.VectorClock {
 	vs.mu.lock()
-	rc := vs.readClock
+	frontier := vs.readClock
+	if frontier != nil {
+		frontier.close()
+		frontier.refreshLegacyLocked()
+	}
+	var rc *vectorclock.VectorClock
+	if frontier != nil {
+		rc = frontier.legacy
+	}
 	vs.mu.unlock()
 	return rc
 }
 
+// JoinReadClock records a reader after a caller observed promoted state. In
+// promoted state it prunes actual read events ordered before observed, but
+// never imports observed's non-reader coordinates. If a writer demoted the
+// state before the lock was acquired, it republishes the reader in the current
+// representation rather than silently dropping it.
+func (vs *VarState) JoinReadClock(e epoch.Epoch, observed *vectorclock.VectorClock) {
+	vs.mu.lock()
+	defer vs.mu.unlock()
+
+	if vs.readerCount == promotedMarker && vs.readClock != nil {
+		recordPromotedRead(vs.readClock.legacy, e, observed)
+		return
+	}
+
+	// A stale promoted decision raced with demotion. Preserve this completed
+	// reader in the now-current inline state when possible.
+	if vs.readerCount == 0 {
+		vs.readEpochs[0] = e
+		vs.readerCount = 1
+		vs.readEpoch0.Store(uint64(e))
+		vs.readerState.Store(1)
+		return
+	}
+
+	tid, _ := e.Decode()
+	for i := uint8(0); i < vs.readerCount && i < maxInlineReaders; i++ {
+		existingTID, _ := vs.readEpochs[i].Decode()
+		if existingTID == tid {
+			vs.readEpochs[i] = e
+			if i == 0 {
+				vs.readEpoch0.Store(uint64(e))
+			}
+			return
+		}
+	}
+
+	// Another reader won the demotion race. Retain both completed reads inline
+	// while capacity remains.
+	if vs.readerCount < maxInlineReaders {
+		vs.readEpochs[vs.readerCount] = e
+		vs.readerCount++
+		vs.readerState.Store(uint32(vs.readerCount))
+		return
+	}
+
+	// All inline slots were filled after the stale promoted observation.
+	// Promote the actual inline read events and this completed read.
+	vs.readClock = newPromotedReadFrontier(vectorclock.NewFromPool(), vs.GetLifecycleID())
+	for i := uint8(0); i < vs.readerCount && i < maxInlineReaders; i++ {
+		if vs.readEpochs[i] != 0 {
+			readerTID, clock := vs.readEpochs[i].Decode()
+			//nolint:gosec // Epoch clocks intentionally use VectorClock's uint32 representation.
+			vs.readClock.legacy.Set(readerTID, uint32(clock))
+		}
+	}
+	setReadClockEpoch(vs.readClock.legacy, e)
+	for i := range vs.readEpochs {
+		vs.readEpochs[i] = 0
+	}
+	vs.readerCount = promotedMarker
+	vs.readerState.Store(promotedMarker32)
+	vs.readEpoch0.Store(0)
+}
+
+// ReadClockHappensBefore reports whether every promoted reader happens before
+// vc. The comparison is serialized with concurrent reader joins and demotion.
+func (vs *VarState) ReadClockHappensBefore(vc *vectorclock.VectorClock) bool {
+	vs.ClosePromotedReadFrontier()
+	vs.mu.lock()
+	if vs.readClock != nil {
+		vs.readClock.refreshLegacyLocked()
+	}
+	result := vs.readClock == nil || vs.readClock.legacy.HappensBefore(vc)
+	vs.mu.unlock()
+	return result
+}
+
+// FirstConcurrentRead returns one represented read that does not happen before
+// vc. The caller normally holds the access lock; mu stabilizes both inline and
+// promoted read representations while they are inspected.
+func (vs *VarState) FirstConcurrentRead(vc *vectorclock.VectorClock) (epoch.Epoch, bool) {
+	vs.ClosePromotedReadFrontier()
+	vs.mu.lock()
+	defer vs.mu.unlock()
+
+	if vs.readerCount == promotedMarker && vs.readClock != nil {
+		for node := vs.readClock.head.Load(); node != nil; node = node.next {
+			read, pc, stable := node.stableEpochPC()
+			if stable && read != 0 && !read.HappensBefore(vc) {
+				// Preserve the PC paired with the exact witness selected below.
+				// The frontier is closed and the caller holds accessMu, so this
+				// diagnostic publication cannot be displaced by another reader.
+				vs.readPC.Store(pc)
+				return read, true
+			}
+		}
+		vs.readClock.refreshLegacyLocked()
+		var concurrent epoch.Epoch
+		vs.readClock.legacy.Range(func(tid, clock uint32) bool {
+			if clock > vc.Get(tid) {
+				concurrent = epoch.NewEpoch(tid, uint64(clock))
+				return false
+			}
+			return true
+		})
+		return concurrent, concurrent != 0
+	}
+
+	for i := uint8(0); i < vs.readerCount && i < maxInlineReaders; i++ {
+		read := vs.readEpochs[i]
+		if i == 0 {
+			read = epoch.Epoch(vs.readEpoch0.Load())
+		}
+		if read != 0 && !read.HappensBefore(vc) {
+			return read, true
+		}
+	}
+	return 0, false
+}
+
 // Demote clears all read state and demotes back to fast path.
-//
-// v0.3.0 Enhanced Read-Shared: Clears both inline slots AND VectorClock.
 //
 // This is called by OnWrite after a write operation to reset read tracking.
 // Write dominates all previous reads, so we can safely clear the read state.
 //
-// This is a key optimization: variables with alternating read/write stay in fast path.
-//
-// Pooling: Returns VectorClock to pool for reuse if promoted.
-//
-// Note: Removed //go:nosplit because spinlock.lock() requires stack space.
+// A promoted VectorClock is returned to its pool.
 func (vs *VarState) Demote() {
-	// Ordering contract: set readerState=0 FIRST, then clear readClock under lock.
-	// This ensures no concurrent reader sees IsPromoted()==true with readClock==nil.
-	vs.readerState.Store(0)
-	vs.readEpoch0.Store(0)
-
+	vs.ClosePromotedReadFrontier()
 	vs.mu.lock()
+	defer vs.mu.unlock()
+
 	// Release VectorClock back to pool if promoted.
-	if vs.readClock != nil {
-		vs.readClock.Release()
+	if vs.readClock != nil && vs.readClock.legacy != nil {
+		vs.readClock.refreshLegacyLocked()
+		vs.readClock.legacy.Release()
 	}
 	// Clear all inline reader slots.
 	for i := range vs.readEpochs {
@@ -464,18 +1028,15 @@ func (vs *VarState) Demote() {
 	}
 	vs.readerCount = 0
 	vs.readClock = nil
-	vs.mu.unlock()
+	vs.readEpoch0.Store(0)
+	vs.readerState.Store(0)
 }
 
-// === Lock-Free Accessor Methods (v0.3.0 Lock-Free Optimization) ===
+// Lock-free accessors.
 
 // GetW returns the last write epoch using atomic load (lock-free).
 //
-// This is the HOT PATH method for checking write epochs during race detection.
-// Using atomic load instead of mutex reduces overhead from ~20-50ns to ~2-5ns.
-//
 // Thread Safety: Lock-free (atomic load).
-// Performance: ~2-5ns (atomic load).
 //
 //go:nosplit
 func (vs *VarState) GetW() epoch.Epoch {
@@ -484,17 +1045,14 @@ func (vs *VarState) GetW() epoch.Epoch {
 
 // SetW sets the last write epoch using atomic store (lock-free).
 //
-// This is the HOT PATH method for updating write epochs during race detection.
-// Using atomic store instead of mutex reduces overhead from ~20-50ns to ~2-5ns.
-//
 // Parameters:
 //   - e: The epoch to store
 //
 // Thread Safety: Lock-free (atomic store).
-// Performance: ~2-5ns (atomic store).
 //
 //go:nosplit
 func (vs *VarState) SetW(e epoch.Epoch) {
+	vs.ClosePromotedReadFrontier()
 	vs.W.Store(uint64(e))
 }
 
@@ -511,14 +1069,14 @@ func (vs *VarState) SetW(e epoch.Epoch) {
 //   - false if swap failed (current value was not 'oldVal')
 //
 // Thread Safety: Lock-free (atomic CAS).
-// Performance: ~5-10ns (atomic CAS).
 //
 //go:nosplit
 func (vs *VarState) CompareAndSwapW(oldVal, newVal epoch.Epoch) bool {
+	vs.ClosePromotedReadFrontier()
 	return vs.W.CompareAndSwap(uint64(oldVal), uint64(newVal))
 }
 
-// === SmartTrack Ownership Tracking Methods (v0.2.0 Task 3) ===
+// Exclusive-writer ownership accessors.
 
 // IsOwned returns true if the variable has an exclusive writer (owned state).
 //
@@ -530,7 +1088,6 @@ func (vs *VarState) CompareAndSwapW(oldVal, newVal epoch.Epoch) bool {
 // This is used by the detector to decide whether to skip happens-before checks.
 //
 // Thread Safety: Lock-free (atomic load).
-// Performance: ~2-5ns (atomic load).
 //
 //go:nosplit
 func (vs *VarState) IsOwned() bool {
@@ -545,7 +1102,6 @@ func (vs *VarState) IsOwned() bool {
 //   - 0: Uninitialized (no writes yet)
 //
 // Thread Safety: Lock-free (atomic load).
-// Performance: ~2-5ns (atomic load).
 //
 //go:nosplit
 func (vs *VarState) GetExclusiveWriter() int64 {
@@ -559,7 +1115,6 @@ func (vs *VarState) GetExclusiveWriter() int64 {
 //   - Second writer detected: Promote to shared (tid = -1)
 //
 // Thread Safety: Lock-free (atomic store).
-// Performance: ~2-5ns (atomic store).
 //
 //go:nosplit
 func (vs *VarState) SetExclusiveWriter(tid int64) {
@@ -581,7 +1136,6 @@ func (vs *VarState) SetExclusiveWriter(tid int64) {
 //   - false if swap failed (current value was not 'oldVal')
 //
 // Thread Safety: Lock-free (atomic CAS).
-// Performance: ~5-10ns (atomic CAS).
 //
 //go:nosplit
 func (vs *VarState) CompareAndSwapExclusiveWriter(oldVal, newVal int64) bool {
@@ -594,9 +1148,6 @@ func (vs *VarState) CompareAndSwapExclusiveWriter(oldVal, newVal int64) bool {
 // Used for statistics and debugging.
 //
 // Thread Safety: Protected by mutex.
-// Performance: <5ns/op (mutex + field increment).
-//
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
 func (vs *VarState) IncrementWriteCount() {
 	vs.mu.lock()
 	vs.writeCount++
@@ -606,9 +1157,6 @@ func (vs *VarState) IncrementWriteCount() {
 // GetWriteCount returns the total number of writes to this variable.
 //
 // Thread Safety: Protected by mutex.
-// Performance: <5ns/op (mutex + field read).
-//
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
 func (vs *VarState) GetWriteCount() uint32 {
 	vs.mu.lock()
 	count := vs.writeCount
@@ -617,8 +1165,6 @@ func (vs *VarState) GetWriteCount() uint32 {
 }
 
 // String returns a debug representation of the variable state.
-//
-// v0.3.0 Enhanced Read-Shared: Shows all inline reader slots.
 //
 // Format:
 //   - No readers: "W:<epoch> R:[]"
@@ -636,12 +1182,14 @@ func (vs *VarState) String() string {
 	// Note: We manually build the string to avoid fmt import overhead.
 	wStr := "W:" + vs.GetW().String()
 
+	vs.ClosePromotedReadFrontier()
 	vs.mu.lock()
 	defer vs.mu.unlock()
 
 	if vs.readerCount == promotedMarker && vs.readClock != nil {
+		vs.readClock.refreshLegacyLocked()
 		// Promoted: Show VectorClock.
-		return wStr + " R:" + vs.readClock.String() + " [PROMOTED]"
+		return wStr + " R:" + vs.readClock.legacy.String() + " [PROMOTED]"
 	}
 
 	// Inline slots: Show all active reader epochs.
@@ -656,7 +1204,7 @@ func (vs *VarState) String() string {
 	return wStr + " " + rStr
 }
 
-// === Stack Trace Accessor Methods (v0.2.0 Task 6) ===
+// Stack trace accessors.
 
 // SetWriteStack records the stack trace hash for a write access.
 //
@@ -666,10 +1214,7 @@ func (vs *VarState) String() string {
 // Parameters:
 //   - stackHash: Hash returned by stackdepot.CaptureStack()
 //
-// Thread Safety: Uses atomic store for lock-free access.
-// Performance: ~2ns (atomic store).
-//
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
+// Thread Safety: Protected by mu.
 func (vs *VarState) SetWriteStack(stackHash uint64) {
 	vs.mu.lock()
 	vs.writeStackHash = stackHash
@@ -684,10 +1229,7 @@ func (vs *VarState) SetWriteStack(stackHash uint64) {
 //   - uint64: Hash that can be passed to stackdepot.GetStack()
 //   - 0: If no write stack has been captured
 //
-// Thread Safety: Uses atomic load for lock-free access.
-// Performance: ~2ns (atomic load).
-//
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
+// Thread Safety: Protected by mu.
 func (vs *VarState) GetWriteStack() uint64 {
 	vs.mu.lock()
 	hash := vs.writeStackHash
@@ -704,9 +1246,6 @@ func (vs *VarState) GetWriteStack() uint64 {
 //   - stackHash: Hash returned by stackdepot.CaptureStack()
 //
 // Thread Safety: Protected by mutex (consistent with other read state).
-// Performance: ~5ns (mutex + field write).
-//
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
 func (vs *VarState) SetReadStack(stackHash uint64) {
 	vs.mu.lock()
 	vs.readStackHash = stackHash
@@ -723,9 +1262,6 @@ func (vs *VarState) SetReadStack(stackHash uint64) {
 //   - 0: If no read stack has been captured
 //
 // Thread Safety: Protected by mutex (consistent with other read state).
-// Performance: ~5ns (mutex + field read).
-//
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
 func (vs *VarState) GetReadStack() uint64 {
 	vs.mu.lock()
 	hash := vs.readStackHash
@@ -733,18 +1269,16 @@ func (vs *VarState) GetReadStack() uint64 {
 	return hash
 }
 
-// === Lazy Stack Capture Methods (v0.3.0 Performance) ===
+// Caller-PC accessors.
 
 // SetWritePC stores the program counter (PC) of the write caller.
 //
-// This is the HOT PATH optimization: instead of capturing full stack (~500ns),
-// we store only the caller PC (~5ns). Full stack is captured lazily when race detected.
+// The full stack is resolved lazily when a race is reported.
 //
 // Parameters:
 //   - pc: Program counter from runtime.Callers(2, pcs[:1])
 //
 // Thread Safety: Lock-free (atomic store).
-// Performance: ~2-5ns (atomic store).
 //
 //go:nosplit
 func (vs *VarState) SetWritePC(pc uintptr) {
@@ -760,7 +1294,6 @@ func (vs *VarState) SetWritePC(pc uintptr) {
 //   - 0: If no write PC has been captured
 //
 // Thread Safety: Lock-free (atomic load).
-// Performance: ~2-5ns (atomic load).
 //
 //go:nosplit
 func (vs *VarState) GetWritePC() uintptr {
@@ -769,13 +1302,10 @@ func (vs *VarState) GetWritePC() uintptr {
 
 // SetReadPC stores the program counter (PC) of the read caller.
 //
-// This is the HOT PATH optimization for reads on read-shared variables.
-//
 // Parameters:
 //   - pc: Program counter from runtime.Callers(2, pcs[:1])
 //
 // Thread Safety: Lock-free (atomic store).
-// Performance: ~2-5ns (atomic store).
 //
 //go:nosplit
 func (vs *VarState) SetReadPC(pc uintptr) {
@@ -791,7 +1321,6 @@ func (vs *VarState) SetReadPC(pc uintptr) {
 //   - 0: If no read PC has been captured
 //
 // Thread Safety: Lock-free (atomic load).
-// Performance: ~2-5ns (atomic load).
 //
 //go:nosplit
 func (vs *VarState) GetReadPC() uintptr {

@@ -1118,6 +1118,12 @@ const (
 
 // Mark gp ready to run.
 func ready(gp *g, traceskip int, next bool) {
+	readyWithWake(gp, traceskip, next, true)
+}
+
+// readyWithWake is the implementation of ready. Suppressing wakep is valid
+// only when the caller will immediately transfer its current P to gp.
+func readyWithWake(gp *g, traceskip int, next, wake bool) {
 	status := readgstatus(gp)
 
 	// Mark runnable.
@@ -1135,7 +1141,9 @@ func ready(gp *g, traceskip int, next bool) {
 		traceRelease(trace)
 	}
 	runqput(mp.p.ptr(), gp, next)
-	wakep()
+	if wake {
+		wakep()
+	}
 	releasem(mp)
 }
 
@@ -2532,7 +2540,16 @@ func oneNewExtraM() {
 	gp.lockedm.set(mp)
 	gp.goid = sched.goidgen.Add(1)
 	if raceenabled {
-		gp.racectx = racegostart(abi.FuncPCABIInternal(newextram) + sys.PCQuantum)
+		// Extra-M contexts are retained and used directly; they are not
+		// ordinary newproc children that can carry a transient spawn token.
+		curg := getg()
+		var parentCtx uintptr
+		if curg.m != nil && curg.m.curg != nil {
+			parentCtx = curg.m.curg.racectx
+		} else {
+			parentCtx = curg.racectx
+		}
+		gp.racectx = racectxstart(abi.FuncPCABIInternal(newextram)+sys.PCQuantum, parentCtx)
 	}
 	// put on allg for garbage collector
 	allgadd(gp)
@@ -5412,14 +5429,14 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 
 	// Set up race context.
 	if raceenabled {
-		newg.racectx = racegostart(callerpc)
+		spawnctx := racegostart(callerpc)
 		// T13: racegosetchildid eagerly creates the child's RaceContext
 		// and returns its pointer for caching in newg.racectx.
-		// This eliminates the first-access slow path (contextsMap lookup).
-		if ctx := racegosetchildid(newg.goid); ctx != 0 {
-			newg.racectx = ctx
-		}
+		// Keep the transient spawn token local: g.racectx is consumed by hot
+		// paths as a context pointer and must never expose that token.
+		newg.racectx = racegosetchildid(newg.goid, spawnctx)
 		newg.raceignore = 0
+		newg.raceguard = 0
 		if newg.labels != nil {
 			// See note in proflabel.go on labelSync's role in synchronizing
 			// with the reads in the signal handler.

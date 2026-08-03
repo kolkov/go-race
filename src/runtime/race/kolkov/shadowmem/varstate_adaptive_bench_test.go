@@ -7,6 +7,64 @@ import (
 	"runtime/race/kolkov/vectorclock"
 )
 
+func BenchmarkOrdinaryFastMaterializedRead(b *testing.B) {
+	pt := NewPageTableShadow()
+	const addr = uintptr(0x70000)
+	state := pt.GetOrCreate(addr)
+	current := epoch.NewEpoch(71, 17)
+	clock := vectorclock.New()
+	clock.Set(71, 17)
+	if result, cached := pt.TryOrdinaryRead(addr, 1, current, clock, 0x7100); result != OrdinaryFastHandledCacheable || cached != state {
+		b.Fatalf("ordinary read warmup = (%v, %p), want cacheable %p", result, cached, state)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if result, cached := pt.TryOrdinaryRead(addr, 1, current, clock, 0x7100); result != OrdinaryFastHandledCacheable || cached != state {
+			b.Fatal("ordinary materialized read missed")
+		}
+	}
+}
+
+func BenchmarkOrdinaryFastCompactRead(b *testing.B) {
+	pt := NewPageTableShadow()
+	const addr = uintptr(0x70080)
+	current := epoch.NewEpoch(72, 19)
+	clock := vectorclock.New()
+	clock.Set(72, 19)
+	if got := pt.TryCompactRead(addr, current, clock, 0x7200); got != CompactReadHandled {
+		b.Fatalf("compact warmup=%v", got)
+	}
+	if result, cached := pt.TryOrdinaryRead(addr, 1, current, clock, 0x7200); result != OrdinaryFastHandledCacheable || cached == nil {
+		b.Fatalf("ordinary compact warmup = (%v, %p)", result, cached)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if result, cached := pt.TryOrdinaryRead(addr, 1, current, clock, 0x7200); result != OrdinaryFastHandledCacheable || cached == nil {
+			b.Fatal("ordinary compact read missed")
+		}
+	}
+}
+
+func BenchmarkOrdinaryFastContentionMiss(b *testing.B) {
+	pt := NewPageTableShadow()
+	const addr = uintptr(0x700c0)
+	state := pt.GetOrCreate(addr)
+	current := epoch.NewEpoch(73, 23)
+	clock := vectorclock.New()
+	clock.Set(73, 23)
+	state.LockAccess()
+	defer state.UnlockAccess()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if result, cached := pt.TryOrdinaryRead(addr, 1, current, clock, 0x7300); result != OrdinaryFastMiss || cached != nil {
+			b.Fatal("contended ordinary read did not miss")
+		}
+	}
+}
+
 // Baseline: Phase 2 behavior (always using Epoch for comparison).
 // We'll simulate this by measuring epoch-only operations.
 
@@ -72,20 +130,17 @@ func BenchmarkVarState_MultipleReaders_Phase3_Promoted(b *testing.B) {
 	vs := NewVarState()
 
 	// Promote to VectorClock.
-	vc := vectorclock.New()
-	vc.Set(5, 100)
-	vs.PromoteToReadClock(vc)
+	vs.PromoteToReadClock(epoch.NewEpoch(5, 100), nil)
 
-	vc2 := vectorclock.New()
-	vc2.Set(3, 50)
+	read := epoch.NewEpoch(3, 50)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		// Simulate read: Check promoted, then join.
+		// Simulate read: Check promoted, then record its event.
 		if vs.IsPromoted() {
-			vs.GetReadClock().Join(vc2)
+			vs.JoinReadClock(read, nil)
 		}
 	}
 }
@@ -99,12 +154,10 @@ func BenchmarkVarState_Promotion_Overhead(b *testing.B) {
 		b.StopTimer()
 		vs := NewVarState()
 		vs.SetReadEpoch(epoch.NewEpoch(5, 100))
-		vc := vectorclock.New()
-		vc.Set(3, 50)
 		b.StartTimer()
 
 		// Measure only promotion cost.
-		vs.PromoteToReadClock(vc)
+		vs.PromoteToReadClock(epoch.NewEpoch(3, 50), nil)
 	}
 }
 
@@ -136,9 +189,7 @@ func BenchmarkVarState_GetReadEpoch_Unpromoted(b *testing.B) {
 // BenchmarkVarState_GetReadClock_Promoted benchmarks slow-path read clock access.
 func BenchmarkVarState_GetReadClock_Promoted(b *testing.B) {
 	vs := NewVarState()
-	vc := vectorclock.New()
-	vc.Set(5, 100)
-	vs.PromoteToReadClock(vc)
+	vs.PromoteToReadClock(epoch.NewEpoch(5, 100), nil)
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -155,9 +206,7 @@ func BenchmarkVarState_Demotion(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
 		vs := NewVarState()
-		vc := vectorclock.New()
-		vc.Set(5, 100)
-		vs.PromoteToReadClock(vc)
+		vs.PromoteToReadClock(epoch.NewEpoch(5, 100), nil)
 		b.StartTimer()
 
 		// Measure demotion cost.
@@ -170,8 +219,7 @@ func BenchmarkVarState_Demotion(b *testing.B) {
 // This simulates alternating concurrent reads and writes (realistic workload).
 func BenchmarkVarState_PromotionDemotion_Cycle(b *testing.B) {
 	vs := NewVarState()
-	vc := vectorclock.New()
-	vc.Set(5, 100)
+	read := epoch.NewEpoch(5, 100)
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -179,7 +227,7 @@ func BenchmarkVarState_PromotionDemotion_Cycle(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// Promotion (concurrent reads).
 		vs.SetReadEpoch(epoch.NewEpoch(3, 50))
-		vs.PromoteToReadClock(vc)
+		vs.PromoteToReadClock(read, nil)
 
 		// Demotion (write).
 		vs.SetReadEpoch(0)
@@ -224,20 +272,17 @@ func BenchmarkVarState_FastPath_Read_Different_Epoch(b *testing.B) {
 // BenchmarkVarState_SlowPath_Read_VectorClock benchmarks slow path read (promoted).
 func BenchmarkVarState_SlowPath_Read_VectorClock(b *testing.B) {
 	vs := NewVarState()
-	vc := vectorclock.New()
-	vc.Set(5, 100)
-	vs.PromoteToReadClock(vc)
+	vs.PromoteToReadClock(epoch.NewEpoch(5, 100), nil)
 
-	vc2 := vectorclock.New()
-	vc2.Set(3, 50)
+	read := epoch.NewEpoch(3, 50)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		// Slow path: VectorClock join (should be ~300-500ns).
+		// Slow path: record one read event.
 		if vs.IsPromoted() {
-			vs.GetReadClock().Join(vc2)
+			vs.JoinReadClock(read, nil)
 		}
 	}
 }
@@ -265,9 +310,7 @@ func BenchmarkVarState_Write_Demote_SlowPath(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
 		vs := NewVarState()
-		vc := vectorclock.New()
-		vc.Set(5, 100)
-		vs.PromoteToReadClock(vc)
+		vs.PromoteToReadClock(epoch.NewEpoch(5, 100), nil)
 		writeEpoch := epoch.NewEpoch(3, 200)
 		b.StartTimer()
 
@@ -296,10 +339,8 @@ func BenchmarkVarState_String_Unpromoted(b *testing.B) {
 func BenchmarkVarState_String_Promoted(b *testing.B) {
 	vs := NewVarState()
 	vs.SetW(epoch.NewEpoch(5, 100))
-	vc := vectorclock.New()
-	vc.Set(3, 50)
-	vc.Set(7, 60)
-	vs.PromoteToReadClock(vc)
+	vs.SetReadEpoch(epoch.NewEpoch(3, 50))
+	vs.PromoteToReadClock(epoch.NewEpoch(7, 60), nil)
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -333,9 +374,7 @@ func BenchmarkVarState_Reset_Promoted(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
 		vs := NewVarState()
-		vc := vectorclock.New()
-		vc.Set(5, 100)
-		vs.PromoteToReadClock(vc)
+		vs.PromoteToReadClock(epoch.NewEpoch(5, 100), nil)
 		b.StartTimer()
 
 		vs.Reset()

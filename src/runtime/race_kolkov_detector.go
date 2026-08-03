@@ -8,7 +8,7 @@ package runtime
 
 import (
 	"internal/runtime/atomic"
-	_ "unsafe" // for go:linkname
+	"unsafe" // for go:linkname and the ordinary fast-path state ABI
 )
 
 // Kolkov detector state.
@@ -34,8 +34,7 @@ func kolkovDetectorInit() {
 // kolkovDetectorFini finalizes the Kolkov race detector.
 func kolkovDetectorFini() {
 	kolkovEnabled.Store(0)
-	// Call API Fini to print full report
-	kolkovApiFini()
+	kolkovApiRuntimeFini()
 }
 
 // kolkovRaceErrors returns the number of races detected.
@@ -51,6 +50,18 @@ func kolkovRaceErrors() int {
 //go:nosplit
 func kolkovIncrementErrors() {
 	kolkovErrors.Add(1)
+}
+
+// kolkovReportDone is called only after a complete race report has been
+// printed. Keep halt_on_error out of the memory-access hot path and terminate
+// here so the configured report is never truncated.
+//
+//go:linkname kolkovReportDone
+//go:nosplit
+func kolkovReportDone() {
+	if raceKolkovHaltOnError {
+		exit(raceKolkovExitCode)
+	}
 }
 
 // kolkovOnRead handles a memory read access.
@@ -114,6 +125,29 @@ func kolkovGetGoid() int64 {
 // Linkname imports from runtime/race/kolkov/api package.
 // These functions are implemented in the Kolkov API and exported to runtime.
 
+// kolkovApiTryReadFast and kolkovApiTryWriteFast are the only ordinary-access
+// calls made directly from a user goroutine. Status values mirror
+// shadowmem.OrdinaryFastResult: 0 is miss, 1 is handled, and 2 is handled with
+// an authoritative state pointer suitable for exact read-cache publication.
+
+//go:linkname kolkovApiTryReadFast runtime/race/kolkov/api.raceTryReadFast
+func kolkovApiTryReadFast(addr, size, pc, racectx uintptr) (state unsafe.Pointer, status uint8)
+
+//go:linkname kolkovApiTryWriteFast runtime/race/kolkov/api.raceTryWriteFast
+func kolkovApiTryWriteFast(addr, size, pc, racectx uintptr) bool
+
+//go:linkname kolkovApiMaterializeOrdinaryScalar runtime/race/kolkov/api.raceMaterializeOrdinaryScalar
+func kolkovApiMaterializeOrdinaryScalar(addr, size, racectx uintptr) bool
+
+//go:linkname kolkovApiTryAcquireFast runtime/race/kolkov/api.raceTryAcquireFast
+func kolkovApiTryAcquireFast(addr, racectx uintptr) bool
+
+//go:linkname kolkovApiTryReleaseFast runtime/race/kolkov/api.raceTryReleaseFast
+func kolkovApiTryReleaseFast(addr, racectx uintptr) bool
+
+//go:linkname kolkovApiTryReleaseMergeFast runtime/race/kolkov/api.raceTryReleaseMergeFast
+func kolkovApiTryReleaseMergeFast(addr, racectx uintptr) bool
+
 //go:linkname kolkovApiOnRead runtime/race/kolkov/api.raceread
 func kolkovApiOnRead(addr, pc uintptr)
 
@@ -138,24 +172,34 @@ func kolkovApiOnReleaseForGoroutine(addr uintptr, goid int64)
 //go:linkname kolkovApiOnReleaseMergeForGoroutine runtime/race/kolkov/api.raceReleaseMergeForGoroutine
 func kolkovApiOnReleaseMergeForGoroutine(addr uintptr, goid int64)
 
-//go:linkname kolkovApiGoSetChildID runtime/race/kolkov/api.raceGoSetChildID
-func kolkovApiGoSetChildID(childGoid int64)
-
 // T13: Eager context creation during goroutine spawn.
+//
 //go:linkname kolkovApiGoSetChildIDWithCtx runtime/race/kolkov/api.raceGoSetChildIDWithCtx
-func kolkovApiGoSetChildIDWithCtx(childGoid int64) uintptr
+func kolkovApiGoSetChildIDWithCtx(childGoid int64, spawnID uintptr) uintptr
 
 //go:linkname kolkovApiClearShadow runtime/race/kolkov/api.raceClearShadow
 func kolkovApiClearShadow(addr, size uintptr)
 
-//go:linkname kolkovApiFini runtime/race/kolkov/api.Fini
-func kolkovApiFini()
+//go:linkname kolkovApiRuntimeFini runtime/race/kolkov/api.runtimeFini
+func kolkovApiRuntimeFini()
 
 //go:linkname kolkovApiOnGoStart runtime/race/kolkov/api.raceGoStartFromRuntime
-func kolkovApiOnGoStart(pc uintptr, parentGoid int64)
+func kolkovApiOnGoStart(pc uintptr, parentGoid int64) uintptr
+
+//go:linkname kolkovApiOnGoStartFromContext runtime/race/kolkov/api.raceGoStartFromContext
+func kolkovApiOnGoStartFromContext(pc, parentCtx uintptr) uintptr
 
 //go:linkname kolkovApiOnGoEnd runtime/race/kolkov/api.raceGoEndFromRuntime
 func kolkovApiOnGoEnd(goid int64)
+
+//go:linkname kolkovApiFinalizerGo runtime/race/kolkov/api.raceFinalizerGoFromRuntime
+func kolkovApiFinalizerGo(racectx uintptr)
+
+//go:linkname kolkovApiContextStart runtime/race/kolkov/api.raceContextStartFromRuntime
+func kolkovApiContextStart(pc, spawnctx uintptr) uintptr
+
+//go:linkname kolkovApiContextEnd runtime/race/kolkov/api.raceContextEndFromRuntime
+func kolkovApiContextEnd(racectx uintptr)
 
 // === g.racectx Fast/Slow Path Bridges (T9 optimization) ===
 // Fast path: context pointer passed directly as uintptr (skips contextsMap lookup).
@@ -163,8 +207,20 @@ func kolkovApiOnGoEnd(goid int64)
 //go:linkname kolkovOnReadCtx runtime/race/kolkov/api.racereadCtx
 func kolkovOnReadCtx(addr, pc, racectx uintptr)
 
+//go:linkname kolkovOnReadSizedCtx runtime/race/kolkov/api.racereadSizedCtx
+func kolkovOnReadSizedCtx(addr, size, pc, racectx uintptr)
+
 //go:linkname kolkovOnWriteCtx runtime/race/kolkov/api.racewriteCtx
 func kolkovOnWriteCtx(addr, pc, racectx uintptr)
+
+//go:linkname kolkovOnWriteSizedCtx runtime/race/kolkov/api.racewriteSizedCtx
+func kolkovOnWriteSizedCtx(addr, size, pc, racectx uintptr)
+
+//go:linkname kolkovOnReadRangeCtx runtime/race/kolkov/api.racereadRangeCtx
+func kolkovOnReadRangeCtx(addr, size, pc, racectx uintptr)
+
+//go:linkname kolkovOnWriteRangeCtx runtime/race/kolkov/api.racewriteRangeCtx
+func kolkovOnWriteRangeCtx(addr, size, pc, racectx uintptr)
 
 //go:linkname kolkovOnAcquireCtx runtime/race/kolkov/api.raceacquireCtx
 func kolkovOnAcquireCtx(addr, racectx uintptr)
@@ -174,6 +230,9 @@ func kolkovOnReleaseCtx(addr, racectx uintptr)
 
 //go:linkname kolkovOnReleaseMergeCtx runtime/race/kolkov/api.racereleasemergeCtx
 func kolkovOnReleaseMergeCtx(addr, racectx uintptr)
+
+//go:linkname kolkovOnRendezvousCtx runtime/race/kolkov/api.raceRendezvousCtx
+func kolkovOnRendezvousCtx(addr, currentCtx, targetCtx uintptr)
 
 // T26: Shadow pointer getter for inline fast path in runtime.
 // Returns uintptr pointing to the *PageTableShadow struct.
@@ -187,8 +246,20 @@ func kolkovGetShadowPtr() uintptr
 //go:linkname kolkovOnReadSlow runtime/race/kolkov/api.racereadSlow
 func kolkovOnReadSlow(addr, pc uintptr) uintptr
 
+//go:linkname kolkovOnReadSizedSlow runtime/race/kolkov/api.racereadSizedSlow
+func kolkovOnReadSizedSlow(addr, size, pc uintptr) uintptr
+
 //go:linkname kolkovOnWriteSlow runtime/race/kolkov/api.racewriteSlow
 func kolkovOnWriteSlow(addr, pc uintptr) uintptr
+
+//go:linkname kolkovOnWriteSizedSlow runtime/race/kolkov/api.racewriteSizedSlow
+func kolkovOnWriteSizedSlow(addr, size, pc uintptr) uintptr
+
+//go:linkname kolkovOnReadRangeSlow runtime/race/kolkov/api.racereadRangeSlow
+func kolkovOnReadRangeSlow(addr, size, pc uintptr) uintptr
+
+//go:linkname kolkovOnWriteRangeSlow runtime/race/kolkov/api.racewriteRangeSlow
+func kolkovOnWriteRangeSlow(addr, size, pc uintptr) uintptr
 
 //go:linkname kolkovOnAcquireSlow runtime/race/kolkov/api.raceacquireSlow
 func kolkovOnAcquireSlow(addr uintptr) uintptr

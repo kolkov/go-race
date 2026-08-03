@@ -5,162 +5,28 @@ import (
 	"runtime/race/kolkov/vectorclock"
 )
 
-// WaitGroupState tracks happens-before relationships for a sync.WaitGroup.
+// SyncVar tracks happens-before relationships for one runtime-selected
+// synchronization address.
 //
-// WaitGroup creates happens-before edges for goroutine lifecycle synchronization.
-// The Go memory model guarantees:
-//   - WaitGroup.Done() happens-before the corresponding WaitGroup.Wait() returns
-//   - Multiple goroutines can call Done(), creating a synchronization point
-//   - Wait() blocks until all goroutines have called Done()
-//
-// Implementation:
-//   - doneClock: Accumulates vector clocks from all Done() calls
-//   - counter: Tracks Add/Done balance (for optional validation)
+// The runtime maps synchronization operations to addresses before calling the
+// detector. For example, buffered channel elements use per-slot addresses,
+// channel close uses the channel address, and WaitGroup Done operations merge
+// releases at the WaitGroup address. SyncVar therefore needs only the generic
+// release clock; it must not aggregate channel or WaitGroup state itself.
 //
 // Layout:
-//   - doneClock: VectorClock accumulating all Done() operations
-//   - counter: int32 tracking current wait count (optional, for debugging)
-//
-// Operations:
-//   - OnAdd(delta): Increment counter by delta
-//   - OnDone(): Merge current thread's clock into doneClock, decrement counter
-//   - OnWaitBefore(): Prepare for wait (optional validation)
-//   - OnWaitAfter(): Merge accumulated doneClock into waiter's clock
-//
-// Memory:
-//   - Size: ~1KB (1 VectorClock) + 4 bytes (counter)
-//   - Allocated lazily on first WaitGroup operation
-//
-// Lifecycle:
-//   - Created on first WaitGroup operation (Add/Done/Wait)
-//   - Never freed (WaitGroups typically live for program lifetime or are GC'd)
-//
-// Example (parent-child synchronization):
-//
-//	var wg sync.WaitGroup
-//	var data int
-//
-//	// Parent goroutine
-//	wg.Add(1)          // OnAdd increments counter to 1
-//	go func() {
-//	    data = 42      // Child writes
-//	    wg.Done()      // OnDone: merge child's clock into doneClock
-//	}()
-//
-//	wg.Wait()          // OnWaitAfter: merge doneClock into parent's clock
-//	_ = data           // Parent reads (happens-after child write)
-type WaitGroupState struct {
-	// doneClock accumulates vector clocks from all Done() calls.
-	// nil means no Done() has been called yet.
-	//
-	// On Done(), the thread's clock is merged into doneClock.
-	// On Wait(), the waiter merges doneClock into its own clock.
-	doneClock *vectorclock.VectorClock
-
-	// counter tracks the current wait count (Add minus Done).
-	// Used for optional validation to detect misuse patterns.
-	//
-	// - Add(delta): counter += delta
-	// - Done(): counter -= 1
-	// - Wait(): blocks until counter == 0
-	//
-	// This is primarily for debugging and validation, not required for
-	// correctness of happens-before tracking.
-	counter int32
-}
-
-// ChannelState tracks happens-before relationships for a channel.
-//
-// Channels create bidirectional happens-before edges between send and receive operations.
-// The Go memory model guarantees:
-//   - Unbuffered channel: Send synchronizes-with Receive (bidirectional)
-//   - Buffered channel: kth Receive happens-before (k+C)th Send completes
-//   - Channel close: close(ch) happens-before all receives that observe closure
-//
-// For MVP (Task 4.2), we treat all channels as unbuffered for simplicity.
-// This is conservative - it won't produce false negatives (missed races),
-// but may be slightly less permissive than the full memory model.
-//
-// Layout:
-//   - sendClock: VectorClock from the last send operation
-//   - recvClock: VectorClock from the last receive operation
-//   - closeClock: VectorClock from channel close (nil if not closed)
-//   - isClosed: Flag indicating if channel is closed
-//
-// Operations:
-//   - OnSendAfter: Captures sender's clock (sendClock := sender.C)
-//   - OnRecvAfter: Merges sender's clock into receiver (recv.C.Join(sendClock))
-//   - OnClose: Captures close clock, sets isClosed flag
-//
-// Memory:
-//   - Size: ~3KB (3 VectorClocks x 1KB each) + 1 byte flag
-//   - Allocated lazily on first channel operation
-//
-// Lifecycle:
-//   - Created on first channel operation (send/recv/close)
-//   - Never freed (channels typically live for program lifetime or are GC'd)
-//
-// Example (unbuffered channel):
-//
-//	// Goroutine 1 (sender)
-//	ch <- value         // OnSendAfter captures sender's clock
-//
-//	// Goroutine 2 (receiver)
-//	<-ch                // OnRecvAfter merges sender's clock into receiver
-//	// Receiver now happens-after sender
-type ChannelState struct {
-	// sendClock is the vector clock from the last send operation.
-	// nil means no send has occurred yet (uninitialized channel).
-	//
-	// On Send, the sender's clock is captured into sendClock.
-	// On Receive, the receiver merges sendClock into its own clock.
-	sendClock *vectorclock.VectorClock
-
-	// recvClock is the vector clock from the last receive operation.
-	// nil means no receive has occurred yet.
-	//
-	// For bidirectional synchronization (unbuffered channels), recvClock
-	// can be merged back into sender's clock if needed.
-	// MVP: Not used for now, reserved for future bidirectional sync.
-	recvClock *vectorclock.VectorClock
-
-	// closeClock is the vector clock when the channel was closed.
-	// nil means channel is not closed yet.
-	//
-	// On Close, the closer's clock is captured into closeClock.
-	// All subsequent receives will merge closeClock (happens-before closure).
-	closeClock *vectorclock.VectorClock
-
-	// isClosed indicates if the channel has been closed.
-	// true means close(ch) was called.
-	//
-	// After close, receives are allowed (until channel is drained),
-	// but sends will panic. We track this for correctness.
-	isClosed bool
-}
-
-// SyncVar tracks happens-before relationships for a synchronization primitive.
-//
-// Each sync primitive (mutex, rwmutex, channel, etc.) has its own SyncVar
-// that stores the vector clock from the last Release operation. This enables
-// the FastTrack algorithm to establish happens-before edges across threads.
-//
-// Layout:
-//   - releaseClock: VectorClock captured at last Release (Unlock)
+//   - releaseMu: serializes canonical release-clock reads and writers
+//   - releaseClock: exact canonical value captured or merged at Release
+//   - versions: exactly three reusable immutable publication slots
 //
 // Operations:
 //   - Acquire: Thread merges releaseClock into its own clock
 //   - Release: Thread copies its clock into releaseClock
-//   - ReleaseMerge: Thread merges its clock into releaseClock (for RWMutex)
-//
-// Memory:
-//   - Size: ~8 bytes (pointer to VectorClock)
-//   - VectorClock: 1KB (256 uint32s)
-//   - Total per mutex: ~1KB
+//   - ReleaseMerge: Thread merges its clock into releaseClock
 //
 // Lifecycle:
-//   - Created on first Lock/Unlock of a mutex
-//   - Never freed (mutexes typically live for program lifetime)
+//   - Created on first operation for a synchronization address
+//   - Removed from SyncShadow when the allocator clears that address's range
 //   - releaseClock allocated lazily on first Release
 //
 // Example:
@@ -169,8 +35,12 @@ type ChannelState struct {
 //	// First unlock: sv.releaseClock = nil
 //	sv.SetReleaseClock(threadClock)  // Allocates and copies
 //	// Next lock: threadClock.Join(sv.releaseClock)
-//	sv.SetReleaseClock(threadClock)  // Updates existing clock
+//	sv.SetReleaseClock(threadClock)  // Publishes an exact replacement
 type SyncVar struct {
+	// releaseMu serializes canonical access to releaseClock and every writer.
+	// Fast acquires instead pin and revalidate an immutable version slot.
+	releaseMu spinlock
+
 	// releaseClock is the vector clock from the last Release operation.
 	// nil means no Release has occurred yet (uninitialized mutex).
 	//
@@ -179,25 +49,180 @@ type SyncVar struct {
 	//
 	// On Release (Unlock), this is updated to the current thread's clock.
 	//
-	// Thread Safety: Uses atomic.Pointer for concurrent access.
-	// MergeReleaseClock (from wg.Done/RWMutex.RUnlock) can be called
-	// concurrently by multiple goroutines. The atomic pointer + CAS loop
-	// ensures no data races on the underlying VectorClock.
+	// Thread Safety: releaseMu protects canonical access. MergeReleaseClock may
+	// be called concurrently by multiple goroutines (for example, concurrent
+	// WaitGroup.Done or RWMutex.RUnlock).
 	releaseClock atomic.Pointer[vectorclock.VectorClock]
 
-	// channel tracks happens-before relationships for channel operations.
-	// nil means this SyncVar is not used for a channel (it's a mutex/rwmutex).
-	//
-	// Allocated lazily on first channel operation (send/recv/close).
-	// Phase 4 Task 4.2: Channel synchronization support.
-	channel *ChannelState
+	// pending is an append-only generation of exact ReleaseMerge projections.
+	// Publishers do not read or import this aggregate; Acquire folds it into the
+	// canonical release clock once.
+	pending atomic.Pointer[mergeGeneration]
 
-	// waitGroup tracks happens-before relationships for WaitGroup operations.
-	// nil means this SyncVar is not used for a WaitGroup.
-	//
-	// Allocated lazily on first WaitGroup operation (Add/Done/Wait).
-	// Phase 4 Task 4.3: WaitGroup synchronization support.
-	waitGroup *WaitGroupState
+	// versions are the only reusable publication slots. current points at an
+	// immutable slot. A writer may change only a non-current slot whose pin
+	// count is zero, and then publishes it with a fresh non-zero generation.
+	versions [3]releaseVersion
+	current  atomic.Pointer[releaseVersion]
+
+	// nextGeneration is protected by releaseMu. Once exhausted is set, the
+	// canonical path remains available but no slot can ever be republished;
+	// this prevents a wrapped generation from reviving an old reader token.
+	nextGeneration uint64
+	exhausted      bool
+
+	// retired is set only after SyncShadow has removed this identity from its
+	// lookup chains. Retired identities remain GC-safe for stale readers, but
+	// can never publish another reusable version.
+	retired atomic.Uint32
+
+	// sourceProof describes the RaceContext projection captured by the latest
+	// Set release. TIDs are process-lifetime identities, so a matching TID and
+	// foreign generation proves that the source still dominates this release.
+	// folded means releaseClock is an immutable base whose sourceTID coordinate
+	// must be replaced by sourceClock. These fields are protected by releaseMu.
+	sourceTID               uint32
+	sourceClock             uint32
+	sourceForeignGeneration uint64
+	sourceProofValid        bool
+	folded                  bool
+}
+
+type releaseVersion struct {
+	clock      *vectorclock.VectorClock
+	generation atomic.Uint64
+	pins       atomic.Uint32
+}
+
+func (sv *SyncVar) retire() {
+	sv.releaseMu.lock()
+	// ClearRange is an allocator-lifecycle callback and may run while the heap
+	// is being swept, so retirement must not fold a pending ReleaseMerge: that
+	// may materialize a wide projection and allocate. Close publisher admission,
+	// invalidate reusable publications, then quiesce and discard the detached
+	// generation without materializing it. The address-lifetime cut makes the
+	// old identity inert; stale context-cache entries re-resolve the address.
+	sv.retired.Store(1)
+	sv.current.Store(nil)
+	sv.discardPendingLocked()
+	sv.releaseMu.unlock()
+}
+
+func (sv *SyncVar) sourceDominatedLocked(clock *vectorclock.VectorClock, tid uint32, foreignGeneration uint64) bool {
+	return clock != nil && sv.sourceProofValid && sv.sourceTID == tid &&
+		sv.sourceForeignGeneration == foreignGeneration && sv.releaseClock.Load() != nil &&
+		clock.Get(tid) >= sv.sourceClock
+}
+
+func (sv *SyncVar) setSourceProofLocked(tid, clock uint32, foreignGeneration uint64, valid bool) {
+	sv.sourceTID = tid
+	sv.sourceClock = clock
+	sv.sourceForeignGeneration = foreignGeneration
+	sv.sourceProofValid = valid
+	sv.folded = false
+}
+
+// materializeFoldedLocked converts the exact base-plus-owner representation
+// into a standalone canonical VectorClock. It is used only by a canonical
+// operation, so allocation and shape growth are permitted here.
+func (sv *SyncVar) materializeFoldedLocked() *vectorclock.VectorClock {
+	base := sv.releaseClock.Load()
+	if base == nil || !sv.folded {
+		return base
+	}
+	current := sv.current.Load()
+	slot := sv.reusableVersionLocked(current, base, nil, false)
+	var result *vectorclock.VectorClock
+	if slot == nil {
+		result = base.CloneDetached()
+	} else if slot.clock == nil {
+		slot.clock = base.CloneDetached()
+		result = slot.clock
+	} else {
+		slot.clock.CopyFromDetached(base)
+		result = slot.clock
+	}
+	result.Set(sv.sourceTID, sv.sourceClock)
+	sv.folded = false
+	sv.publishLocked(slot, result)
+	sv.refreshVersionsLocked(result)
+	return result
+}
+
+func (sv *SyncVar) nextGenerationLocked() (uint64, bool) {
+	if sv.exhausted {
+		return 0, false
+	}
+	next := sv.nextGeneration + 1
+	if next == 0 {
+		sv.exhausted = true
+		return 0, false
+	}
+	sv.nextGeneration = next
+	if next == ^uint64(0) {
+		sv.exhausted = true
+	}
+	return next, true
+}
+
+// reusableVersionLocked returns a non-current, unpinned slot. exclude is an
+// authoritative clock that may still be mutable through the canonical path
+// even when current is nil, so its slot must not be selected as scratch.
+func (sv *SyncVar) reusableVersionLocked(current *releaseVersion, excludeA, excludeB *vectorclock.VectorClock, requireClock bool) *releaseVersion {
+	for i := range sv.versions {
+		slot := &sv.versions[i]
+		if slot == current || (excludeA != nil && slot.clock == excludeA) ||
+			(excludeB != nil && slot.clock == excludeB) || slot.pins.Load() != 0 {
+			continue
+		}
+		if requireClock && slot.clock == nil {
+			continue
+		}
+		return slot
+	}
+	return nil
+}
+
+func (sv *SyncVar) canPublishLocked() bool {
+	return !sv.exhausted && sv.nextGeneration != ^uint64(0)
+}
+
+func (sv *SyncVar) publishLocked(slot *releaseVersion, clock *vectorclock.VectorClock) bool {
+	sv.releaseClock.Store(clock)
+	generation, ok := sv.nextGenerationLocked()
+	if !ok || slot == nil || sv.retired.Load() != 0 {
+		sv.current.Store(nil)
+		return false
+	}
+	slot.generation.Store(generation)
+	sv.current.Store(slot)
+	return true
+}
+
+// refreshVersionsLocked provisions inactive reusable clocks only on the
+// canonical path. Existing inactive clocks deliberately remain stale: every
+// fast writer overwrites its selected scratch clock with TryCopyFrom before
+// publication, so recopying all three slots on every canonical fallback is
+// pure O(vector-clock-size) overhead. A first publication still allocates each
+// slot once, ensuring later warmed writers have owned storage to overwrite.
+func (sv *SyncVar) refreshVersionsLocked(clock *vectorclock.VectorClock) {
+	if clock == nil {
+		return
+	}
+	current := sv.current.Load()
+	for i := range sv.versions {
+		slot := &sv.versions[i]
+		if slot == current || slot.pins.Load() != 0 {
+			continue
+		}
+		if slot.clock == nil {
+			slot.clock = clock.CloneDetached()
+		} else if !slot.clock.CanCopyFromDetached(clock) {
+			// Capacity growth is a canonical-path effect. CopyFrom both grows and
+			// initializes the slot; warmed same-shape fallbacks skip this work.
+			slot.clock.CopyFromDetached(clock)
+		}
+	}
 }
 
 // GetReleaseClock returns the release clock for this sync variable.
@@ -205,7 +230,9 @@ type SyncVar struct {
 // Returns nil if no Release has occurred yet (uninitialized mutex).
 // The caller should check for nil before using the clock.
 //
-// Thread Safety: Uses atomic.Pointer.Load — safe for concurrent reads.
+// GetReleaseClock is intended for single-threaded inspection and tests. The
+// returned clock remains owned by SyncVar and may be mutated by a later
+// release. Concurrent detector code must use JoinReleaseClock instead.
 //
 // Example:
 //
@@ -214,7 +241,192 @@ type SyncVar struct {
 //	sv.SetReleaseClock(someClock)
 //	clock = sv.GetReleaseClock()   // Returns someClock
 func (sv *SyncVar) GetReleaseClock() *vectorclock.VectorClock {
-	return sv.releaseClock.Load()
+	sv.releaseMu.lock()
+	if sv.retired.Load() != 0 {
+		sv.releaseMu.unlock()
+		return nil
+	}
+	clock := sv.foldPendingLocked()
+	sv.releaseMu.unlock()
+	return clock
+}
+
+// TryJoinReleaseClockForContext first checks the exact same-source dominance
+// proof under the writer lock. A successful proof makes the join a no-op; no
+// vector-clock coordinate can be missing because ForeignGeneration changes on
+// every imported projection while own-clock advances leave it unchanged.
+func (sv *SyncVar) TryJoinReleaseClockForContext(dst *vectorclock.VectorClock, tid uint32, foreignGeneration uint64) (joined, ok bool) {
+	if dst == nil || sv.retired.Load() != 0 || sv.pending.Load() != nil || !sv.releaseMu.tryLock() {
+		return false, false
+	}
+	if sv.retired.Load() != 0 || sv.pending.Load() != nil {
+		sv.releaseMu.unlock()
+		return false, false
+	}
+	if sv.pending.Load() == nil && sv.sourceDominatedLocked(dst, tid, foreignGeneration) {
+		sv.releaseMu.unlock()
+		return false, true
+	}
+	sv.releaseMu.unlock()
+	return sv.TryJoinReleaseClock(dst)
+}
+
+// TryJoinReleaseClock imports one exact immutable published version without
+// waiting or allocating. joined reports whether a release was imported; ok
+// reports whether the fast operation completed. An empty, retired, contended,
+// or capacity-insufficient case conservatively returns ok=false.
+func (sv *SyncVar) TryJoinReleaseClock(dst *vectorclock.VectorClock) (joined, ok bool) {
+	if dst == nil || sv.retired.Load() != 0 || sv.pending.Load() != nil {
+		return false, false
+	}
+	slot := sv.current.Load()
+	if slot == nil {
+		return false, false
+	}
+	generation := slot.generation.Load()
+	if generation == 0 {
+		return false, false
+	}
+	pins := slot.pins.Load()
+	if pins == ^uint32(0) || !slot.pins.CompareAndSwap(pins, pins+1) {
+		return false, false
+	}
+	if sv.retired.Load() != 0 || sv.pending.Load() != nil || sv.current.Load() != slot || slot.generation.Load() != generation {
+		slot.pins.Add(-1)
+		return false, false
+	}
+	ok = dst.TryJoin(slot.clock)
+	slot.pins.Add(-1)
+	if !ok {
+		return false, false
+	}
+	return true, true
+}
+
+// TrySetReleaseClock publishes an exact replacement using a pre-provisioned
+// inactive slot. Scratch preparation may change only that unpublished slot;
+// failure never changes the current or canonical release value.
+func (sv *SyncVar) TrySetReleaseClock(src *vectorclock.VectorClock) bool {
+	return sv.trySetReleaseClock(src, 0, 0, false)
+}
+
+// TrySetReleaseClockForContext publishes an exact replacement while retaining
+// a same-source projection proof. Once warmed, repeated releases from a context
+// whose foreign projection is unchanged update only its owner coordinate and
+// invalidate the immutable generic publication. A foreign acquire falls back
+// and materializes the exact base-plus-owner clock.
+func (sv *SyncVar) TrySetReleaseClockForContext(src *vectorclock.VectorClock, tid uint32, foreignGeneration uint64) bool {
+	return sv.trySetReleaseClock(src, tid, foreignGeneration, true)
+}
+
+func (sv *SyncVar) trySetReleaseClock(src *vectorclock.VectorClock, tid uint32, foreignGeneration uint64, proof bool) bool {
+	if src == nil || sv.retired.Load() != 0 || sv.pending.Load() != nil || !sv.releaseMu.tryLock() {
+		return false
+	}
+	defer sv.releaseMu.unlock()
+	if sv.retired.Load() != 0 || sv.pending.Load() != nil {
+		return false
+	}
+	if proof && sv.sourceDominatedLocked(src, tid, foreignGeneration) {
+		// current may still be pinned by a reader which sampled the preceding
+		// release. Clearing it makes that reader's generation revalidation fail;
+		// the immutable clock itself is not mutated while pinned.
+		sv.current.Store(nil)
+		sv.sourceClock = src.Get(tid)
+		sv.folded = true
+		return true
+	}
+	if !sv.canPublishLocked() {
+		return false
+	}
+	current := sv.current.Load()
+	if sv.folded {
+		base := sv.releaseClock.Load()
+		slot := sv.reusableVersionLocked(current, base, nil, true)
+		if slot == nil || !slot.clock.TryCopyFromDetached(src) {
+			return false
+		}
+		if !sv.publishLocked(slot, slot.clock) {
+			return false
+		}
+		sv.setSourceProofLocked(tid, src.Get(tid), foreignGeneration, proof)
+		return true
+	}
+	if current == nil {
+		return false
+	}
+	slot := sv.reusableVersionLocked(current, nil, nil, true)
+	if slot == nil || !slot.clock.TryCopyFromDetached(src) {
+		return false
+	}
+	if sv.retired.Load() != 0 {
+		return false
+	}
+	if !sv.publishLocked(slot, slot.clock) {
+		return false
+	}
+	sv.setSourceProofLocked(tid, src.Get(tid), foreignGeneration, proof)
+	return true
+}
+
+// TryMergeReleaseClock publishes the exact union of the current release and
+// src. Both preparation steps are all-or-nothing for their destination; a
+// failed second step may leave only the unpublished scratch slot changed.
+func (sv *SyncVar) TryMergeReleaseClock(src *vectorclock.VectorClock) bool {
+	return sv.TryPublishReleaseMergeForContext(src, 0, 0)
+}
+
+// TryMergeReleaseClockForContext folds a same-source merge into the owner
+// coordinate when the source's foreign projection is unchanged. Otherwise it
+// retains the immutable-version merge path.
+func (sv *SyncVar) TryMergeReleaseClockForContext(src *vectorclock.VectorClock, tid uint32, foreignGeneration uint64) bool {
+	return sv.TryPublishReleaseMergeForContext(src, tid, foreignGeneration)
+}
+
+// JoinReleaseClock merges the current release clock into dst while holding the
+// same lock used by SetReleaseClock and MergeReleaseClock. It reports whether a
+// release existed so the owning RaceContext can conservatively invalidate
+// exact foreign-projection proofs. This prevents an acquire from observing an
+// in-place update halfway through CopyFrom or Join.
+func (sv *SyncVar) JoinReleaseClock(dst *vectorclock.VectorClock) bool {
+	if dst == nil {
+		return false
+	}
+	sv.releaseMu.lock()
+	if sv.retired.Load() != 0 {
+		sv.releaseMu.unlock()
+		return false
+	}
+	clock := sv.foldPendingLocked()
+	if clock != nil {
+		dst.Join(clock)
+	}
+	sv.releaseMu.unlock()
+	return clock != nil
+}
+
+// JoinReleaseClockForContext is the canonical identity-aware acquire. It keeps
+// a same-source release folded and dominated; every other source materializes
+// and imports the full exact release before returning.
+func (sv *SyncVar) JoinReleaseClockForContext(dst *vectorclock.VectorClock, tid uint32, foreignGeneration uint64) bool {
+	if dst == nil {
+		return false
+	}
+	sv.releaseMu.lock()
+	if sv.retired.Load() != 0 {
+		sv.releaseMu.unlock()
+		return false
+	}
+	if sv.pending.Load() == nil && sv.sourceDominatedLocked(dst, tid, foreignGeneration) {
+		sv.releaseMu.unlock()
+		return false
+	}
+	clock := sv.foldPendingLocked()
+	if clock != nil {
+		dst.Join(clock)
+	}
+	sv.releaseMu.unlock()
+	return clock != nil
 }
 
 // SetReleaseClock sets the release clock for this sync variable.
@@ -222,17 +434,14 @@ func (sv *SyncVar) GetReleaseClock() *vectorclock.VectorClock {
 // This is called during Release (Unlock) to capture the current thread's
 // vector clock. The clock is copied (not referenced) to avoid aliasing issues.
 //
-// If releaseClock is nil (first Release), a new VectorClock is allocated.
-// Otherwise, the existing clock is updated in place to avoid allocations.
+// The canonical path may allocate or grow an inactive slot, then publishes it
+// immutably. It also refreshes other unpinned slots opportunistically.
 //
 // Parameters:
 //   - clock: The vector clock to copy (must not be nil)
 //
-// Performance:
-//   - First call: Allocates VectorClock (~1KB) and copies
-//   - Subsequent calls: Updates in place (no allocations)
-//
-// Thread Safety: Uses atomic.Pointer.Store — safe for concurrent access.
+// Thread Safety: Safe for concurrent release, release-merge, and acquire
+// operations.
 //
 // Example:
 //
@@ -240,38 +449,59 @@ func (sv *SyncVar) GetReleaseClock() *vectorclock.VectorClock {
 //	ctx := goroutine.Alloc(0)
 //	sv.SetReleaseClock(ctx.C)  // First call: allocates + copies
 //	ctx.IncrementClock()
-//	sv.SetReleaseClock(ctx.C)  // Second call: stores new clone
+//	sv.SetReleaseClock(ctx.C)  // Second call: updates the retained clock
 func (sv *SyncVar) SetReleaseClock(clock *vectorclock.VectorClock) {
-	old := sv.releaseClock.Load()
-	if old == nil {
-		// First Release: allocate and store.
-		sv.releaseClock.Store(clock.Clone())
-	} else {
-		// Subsequent Release: update in place.
-		// Safe because SetReleaseClock is serialized by the sync primitive:
-		// racerelease runs while the lock is held, raceacquire runs after acquiring.
-		old.CopyFrom(clock)
+	sv.setReleaseClock(clock, 0, 0, false)
+}
+
+// SetReleaseClockForContext is the canonical proof-producing Set operation.
+func (sv *SyncVar) SetReleaseClockForContext(clock *vectorclock.VectorClock, tid uint32, foreignGeneration uint64) {
+	sv.setReleaseClock(clock, tid, foreignGeneration, true)
+}
+
+func (sv *SyncVar) setReleaseClock(clock *vectorclock.VectorClock, tid uint32, foreignGeneration uint64, proof bool) {
+	if clock == nil {
+		return
 	}
+	sv.releaseMu.lock()
+	if sv.retired.Load() != 0 {
+		sv.releaseMu.unlock()
+		return
+	}
+	sv.discardPendingLocked()
+	current := sv.current.Load()
+	sv.current.Store(nil)
+	slot := sv.reusableVersionLocked(current, nil, nil, false)
+	var result *vectorclock.VectorClock
+	if slot == nil {
+		result = clock.CloneDetached()
+	} else if slot.clock == nil {
+		slot.clock = clock.CloneDetached()
+		result = slot.clock
+	} else {
+		slot.clock.CopyFromDetached(clock)
+		result = slot.clock
+	}
+	sv.publishLocked(slot, result)
+	sv.setSourceProofLocked(tid, clock.Get(tid), foreignGeneration, proof)
+	sv.refreshVersionsLocked(result)
+	sv.releaseMu.unlock()
 }
 
 // MergeReleaseClock merges a clock into the release clock (for RWMutex).
 //
-// This is used for RWMutex write unlock (racereleasemerge) where multiple
+// This is used for RWMutex read unlock (racereleasemerge) where multiple
 // readers may have overlapping critical sections. We merge all their clocks
 // to capture the union of happens-before relationships.
 //
-// If releaseClock is nil (first Release), the clock is copied.
-// Otherwise, the join operation (element-wise max) is performed in place.
+// The canonical path constructs the exact union in an inactive slot or a
+// standalone fallback clock, then publishes the completed value.
 //
 // Parameters:
 //   - clock: The vector clock to merge (must not be nil)
 //
-// Performance:
-//   - First call: Allocates VectorClock (~1KB) and copies
-//   - Subsequent calls: Element-wise max (no allocations)
-//
-// Thread Safety: Uses atomic CAS loop — safe for concurrent access from
-// multiple goroutines (e.g., concurrent wg.Done or RWMutex.RUnlock).
+// Thread Safety: Safe for concurrent access from multiple goroutines (for
+// example, concurrent RWMutex.RUnlock operations) and concurrent acquires.
 //
 // Example (RWMutex scenario):
 //
@@ -281,327 +511,7 @@ func (sv *SyncVar) SetReleaseClock(clock *vectorclock.VectorClock) {
 //	// Reader 2 unlocks
 //	sv.MergeReleaseClock(reader2Clock)  // Second unlock: merge
 //	// Writer locks
-//	writerClock.Join(sv.GetReleaseClock())  // Gets union of both readers
+//	sv.JoinReleaseClock(writerClock)  // Gets union of both readers
 func (sv *SyncVar) MergeReleaseClock(clock *vectorclock.VectorClock) {
-	// CAS loop: concurrent goroutines (wg.Done, RWMutex.RUnlock) can call
-	// this simultaneously. Clone-merge-CAS ensures no data race on the
-	// underlying VectorClock.
-	for {
-		old := sv.releaseClock.Load()
-		var merged *vectorclock.VectorClock
-		if old == nil {
-			merged = clock.Clone()
-		} else {
-			merged = old.Clone()
-			merged.Join(clock)
-		}
-		if sv.releaseClock.CompareAndSwap(old, merged) {
-			return
-		}
-		// CAS failed — another goroutine updated concurrently. Retry.
-	}
-}
-
-// === Channel State Management (Phase 4 Task 4.2) ===
-
-// GetOrCreateChannel returns the ChannelState for this SyncVar, creating it if needed.
-//
-// This is called on the first channel operation (send/recv/close) to lazily
-// allocate the ChannelState. Subsequent operations reuse the same instance.
-//
-// Returns:
-//   - *ChannelState: The channel state (never nil after this call)
-//
-// Thread Safety: NOT thread-safe on its own. The caller (SyncShadow) must
-// ensure synchronization via sync.Map.
-//
-// Example:
-//
-//	sv := &SyncVar{}
-//	chState := sv.GetOrCreateChannel()  // Allocates ChannelState
-//	chState2 := sv.GetOrCreateChannel() // Returns same instance
-//	assert(chState == chState2)
-func (sv *SyncVar) GetOrCreateChannel() *ChannelState {
-	if sv.channel == nil {
-		sv.channel = &ChannelState{}
-	}
-	return sv.channel
-}
-
-// GetChannel returns the ChannelState for this SyncVar, or nil if not a channel.
-//
-// This is a read-only accessor for checking if a SyncVar is being used
-// as a channel (vs mutex/rwmutex).
-//
-// Returns:
-//   - *ChannelState: The channel state, or nil if this is not a channel
-//
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization.
-func (sv *SyncVar) GetChannel() *ChannelState {
-	return sv.channel
-}
-
-// SetChannelSendClock captures the sender's clock on channel send.
-//
-// This is called after a channel send completes. The sender's clock is
-// copied into the channel's sendClock for the receiver to merge.
-//
-// Parameters:
-//   - clock: The sender's vector clock (must not be nil)
-//
-// Performance:
-//   - First call: Allocates VectorClock (~1KB) and copies
-//   - Subsequent calls: Updates in place (no allocations)
-//
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization.
-//
-// Example:
-//
-//	chState := sv.GetOrCreateChannel()
-//	sv.SetChannelSendClock(senderCtx.C)  // Capture sender's clock
-func (sv *SyncVar) SetChannelSendClock(clock *vectorclock.VectorClock) {
-	chState := sv.GetOrCreateChannel()
-	if chState.sendClock == nil {
-		// First send: Allocate and copy.
-		chState.sendClock = clock.Clone()
-	} else {
-		// Subsequent send: Update in place.
-		// v0.3.0: Use CopyFrom for sparse-aware copying.
-		chState.sendClock.CopyFrom(clock)
-	}
-}
-
-// GetChannelSendClock returns the channel's send clock.
-//
-// Returns nil if no send has occurred yet.
-//
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization.
-func (sv *SyncVar) GetChannelSendClock() *vectorclock.VectorClock {
-	if sv.channel == nil {
-		return nil
-	}
-	return sv.channel.sendClock
-}
-
-// SetChannelRecvClock captures the receiver's clock on channel receive.
-//
-// This is called after a channel receive completes. The receiver's clock is
-// copied into the channel's recvClock for potential bidirectional sync.
-//
-// Parameters:
-//   - clock: The receiver's vector clock (must not be nil)
-//
-// Performance:
-//   - First call: Allocates VectorClock (~1KB) and copies
-//   - Subsequent calls: Updates in place (no allocations)
-//
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization.
-func (sv *SyncVar) SetChannelRecvClock(clock *vectorclock.VectorClock) {
-	chState := sv.GetOrCreateChannel()
-	if chState.recvClock == nil {
-		// First recv: Allocate and copy.
-		chState.recvClock = clock.Clone()
-	} else {
-		// Subsequent recv: Update in place.
-		// v0.3.0: Use CopyFrom for sparse-aware copying.
-		chState.recvClock.CopyFrom(clock)
-	}
-}
-
-// GetChannelRecvClock returns the channel's receive clock.
-//
-// Returns nil if no receive has occurred yet.
-//
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization.
-func (sv *SyncVar) GetChannelRecvClock() *vectorclock.VectorClock {
-	if sv.channel == nil {
-		return nil
-	}
-	return sv.channel.recvClock
-}
-
-// SetChannelCloseClock captures the closer's clock on channel close.
-//
-// This is called when close(ch) is executed. The closer's clock is
-// copied into the channel's closeClock, and isClosed is set to true.
-//
-// Parameters:
-//   - clock: The closer's vector clock (must not be nil)
-//
-// Performance: Allocates VectorClock (~1KB) and copies (one-time).
-//
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization.
-func (sv *SyncVar) SetChannelCloseClock(clock *vectorclock.VectorClock) {
-	chState := sv.GetOrCreateChannel()
-	if chState.closeClock == nil {
-		// Channel close is one-time operation - allocate and copy.
-		chState.closeClock = clock.Clone()
-		chState.isClosed = true
-	}
-	// If already closed, this is a programming error (panic in real code),
-	// but we silently ignore for robustness.
-}
-
-// GetChannelCloseClock returns the channel's close clock.
-//
-// Returns nil if channel has not been closed yet.
-//
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization.
-func (sv *SyncVar) GetChannelCloseClock() *vectorclock.VectorClock {
-	if sv.channel == nil {
-		return nil
-	}
-	return sv.channel.closeClock
-}
-
-// IsChannelClosed returns true if the channel has been closed.
-//
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization.
-func (sv *SyncVar) IsChannelClosed() bool {
-	if sv.channel == nil {
-		return false
-	}
-	return sv.channel.isClosed
-}
-
-// === WaitGroup State Management (Phase 4 Task 4.3) ===
-
-// GetOrCreateWaitGroup returns the WaitGroupState for this SyncVar, creating it if needed.
-//
-// This is called on the first WaitGroup operation (Add/Done/Wait) to lazily
-// allocate the WaitGroupState. Subsequent operations reuse the same instance.
-//
-// Returns:
-//   - *WaitGroupState: The WaitGroup state (never nil after this call)
-//
-// Thread Safety: NOT thread-safe on its own. The caller (SyncShadow) must
-// ensure synchronization via sync.Map.
-//
-// Example:
-//
-//	sv := &SyncVar{}
-//	wgState := sv.GetOrCreateWaitGroup()  // Allocates WaitGroupState
-//	wgState2 := sv.GetOrCreateWaitGroup() // Returns same instance
-//	assert(wgState == wgState2)
-func (sv *SyncVar) GetOrCreateWaitGroup() *WaitGroupState {
-	if sv.waitGroup == nil {
-		sv.waitGroup = &WaitGroupState{}
-	}
-	return sv.waitGroup
-}
-
-// GetWaitGroup returns the WaitGroupState for this SyncVar, or nil if not a WaitGroup.
-//
-// This is a read-only accessor for checking if a SyncVar is being used
-// as a WaitGroup (vs mutex/rwmutex/channel).
-//
-// Returns:
-//   - *WaitGroupState: The WaitGroup state, or nil if this is not a WaitGroup
-//
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization.
-func (sv *SyncVar) GetWaitGroup() *WaitGroupState {
-	return sv.waitGroup
-}
-
-// WaitGroupAdd increments the WaitGroup counter by delta.
-//
-// This is called on WaitGroup.Add(delta). The counter is used for optional
-// validation to detect misuse patterns (e.g., Done without Add).
-//
-// Parameters:
-//   - delta: The delta to add to the counter (positive for Add, negative for Done)
-//
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization. In practice, this is protected by the actual WaitGroup's
-// internal mutex.
-//
-// Example:
-//
-//	wgState := sv.GetOrCreateWaitGroup()
-//	sv.WaitGroupAdd(1)  // Add(1)
-//	sv.WaitGroupAdd(3)  // Add(3) - counter now 4
-//	sv.WaitGroupAdd(-1) // Done() - counter now 3
-func (sv *SyncVar) WaitGroupAdd(delta int) {
-	wgState := sv.GetOrCreateWaitGroup()
-	wgState.counter += int32(delta) //nolint:gosec // G115: WaitGroup delta is typically small (<1000), overflow unlikely
-}
-
-// MergeWaitGroupDoneClock merges a thread's clock into the WaitGroup's doneClock.
-//
-// This is called on WaitGroup.Done() to accumulate the happens-before
-// relationship. All Done() calls are merged into a single doneClock that
-// will be propagated to the waiter.
-//
-// Parameters:
-//   - clock: The thread's vector clock (must not be nil)
-//
-// Performance:
-//   - First call: Allocates VectorClock (~1KB) and copies
-//   - Subsequent calls: Element-wise max (no allocations)
-//
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization.
-//
-// Example:
-//
-//	// Child goroutine 1
-//	wgState := sv.GetOrCreateWaitGroup()
-//	sv.MergeWaitGroupDoneClock(child1Ctx.C)  // First Done: copy
-//	// Child goroutine 2
-//	sv.MergeWaitGroupDoneClock(child2Ctx.C)  // Second Done: merge
-//	// Parent waits
-//	parentCtx.C.Join(sv.GetWaitGroupDoneClock())  // Gets union of both children
-func (sv *SyncVar) MergeWaitGroupDoneClock(clock *vectorclock.VectorClock) {
-	wgState := sv.GetOrCreateWaitGroup()
-	if wgState.doneClock == nil {
-		// First Done: Allocate and copy.
-		wgState.doneClock = clock.Clone()
-	} else {
-		// Subsequent Done: Merge (join) the clocks.
-		// For each thread, take the maximum clock value.
-		wgState.doneClock.Join(clock)
-	}
-}
-
-// GetWaitGroupDoneClock returns the WaitGroup's accumulated done clock.
-//
-// Returns nil if no Done() has been called yet.
-//
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization.
-//
-// Example:
-//
-//	doneClock := sv.GetWaitGroupDoneClock()
-//	if doneClock != nil {
-//	    waiterCtx.C.Join(doneClock)  // Merge into waiter's clock
-//	}
-func (sv *SyncVar) GetWaitGroupDoneClock() *vectorclock.VectorClock {
-	if sv.waitGroup == nil {
-		return nil
-	}
-	return sv.waitGroup.doneClock
-}
-
-// GetWaitGroupCounter returns the current WaitGroup counter value.
-//
-// This is primarily for debugging and validation. Returns 0 if no
-// WaitGroup operations have occurred.
-//
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization.
-func (sv *SyncVar) GetWaitGroupCounter() int32 {
-	if sv.waitGroup == nil {
-		return 0
-	}
-	return sv.waitGroup.counter
+	sv.PublishReleaseMergeForContext(clock, 0, 0)
 }

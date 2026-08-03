@@ -425,7 +425,9 @@ func racefuncenter(callpc uintptr)
 func racefuncenterfp(fp uintptr)
 func racefuncexit()
 func raceread(addr uintptr)
+func racereadn(addr, size uintptr)
 func racewrite(addr uintptr)
+func racewriten(addr, size uintptr)
 func racereadrange(addr, size uintptr)
 func racewriterange(addr, size uintptr)
 func racereadrangepc1(addr, size, pc uintptr)
@@ -546,6 +548,12 @@ func racefree(p unsafe.Pointer, sz uintptr) {
 	racecall(&__tsan_free, uintptr(p), sz, 0, 0)
 }
 
+// raceheapspanfree is PureGo-specific. TSAN already observes object frees and
+// must not receive an additional __tsan_free for the containing span.
+//
+//go:nosplit
+func raceheapspanfree(p unsafe.Pointer, size uintptr) {}
+
 //go:nosplit
 func racegostart(pc uintptr) uintptr {
 	gp := getg()
@@ -562,10 +570,11 @@ func racegostart(pc uintptr) uintptr {
 }
 
 //go:nosplit
-func racegosetchildid(childGoid uint64) uintptr {
+func racegosetchildid(childGoid uint64, spawnctx uintptr) uintptr {
 	// TSAN: not needed, racectx already handles child identification.
-	// Return 0 so proc.go keeps the racectx from racegostart.
-	return 0
+	// Return it so proc.go can publish the final context without temporarily
+	// storing the racegostart result in g.racectx.
+	return spawnctx
 }
 
 //go:nosplit
@@ -664,6 +673,14 @@ func racereleaseacquireg(gp *g, addr unsafe.Pointer) {
 		return
 	}
 	racecall(&__tsan_release_acquire, gp.racectx, uintptr(addr), 0, 0)
+}
+
+// racetryrendezvous is implemented only by the pure-Go detector. TSan keeps
+// the established four-hook channel rendezvous sequence.
+//
+//go:nosplit
+func racetryrendezvous(gp *g, addr unsafe.Pointer) bool {
+	return false
 }
 
 //go:nosplit
