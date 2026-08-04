@@ -52,6 +52,24 @@ jobs:
       env:
         CGO_ENABLED: 0
 
+    - name: Run race detection correctness tests
+      run: |
+        echo "Running Go's built-in race detection test suite (runtime/race) with pure-Go detector..."
+        CGO_ENABLED=0 bin/go test -race -v -count=1 -timeout=10m runtime/race 2>&1 | tee race-tests.txt
+        EXIT_CODE=${PIPESTATUS[0]}
+        echo ""
+        echo "=== Summary ==="
+        TOTAL=$(grep -c "^=== RUN" race-tests.txt || true)
+        PASSED=$(grep -c "^--- PASS:" race-tests.txt || true)
+        FAILED=$(grep -c "^--- FAIL:" race-tests.txt || true)
+        SKIPPED=$(grep -c "^--- SKIP:" race-tests.txt || true)
+        echo "Total: ${TOTAL}, Passed: ${PASSED}, Failed: ${FAILED}, Skipped: ${SKIPPED}"
+        if [ "$EXIT_CODE" -ne 0 ]; then
+          echo "::error::Race detection correctness tests failed (exit code ${EXIT_CODE})"
+          grep "^--- FAIL:" race-tests.txt || true
+          exit 1
+        fi
+
     - name: Capture environment
       id: env
       run: |
