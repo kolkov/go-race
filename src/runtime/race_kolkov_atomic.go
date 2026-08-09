@@ -224,7 +224,10 @@ func kolkovSyncAtomicStoreUintptr(addr *uintptr, val uintptr) {
 }
 
 // ---------------------------------------------------------------------------
-// Add (RMW): release + hardware add + acquire
+// Add (RMW): acquire + release + hardware add
+// Acquire BEFORE Release: absorb prior HB edges, then publish merged clock.
+// If reversed, Release overwrites (SetReleaseClock=CopyFrom) the sync var,
+// destroying prior goroutines' clocks before Acquire can read them.
 // ---------------------------------------------------------------------------
 
 //go:nosplit
@@ -234,9 +237,9 @@ func kolkovSyncAtomicAddInt32(addr *int32, delta int32) int32 {
 		return atomic.Xaddint32(addr, delta)
 	}
 	gp.raceignore++
+	raceAtomicAcquire(unsafe.Pointer(addr))
 	raceAtomicRelease(unsafe.Pointer(addr))
 	v := atomic.Xaddint32(addr, delta)
-	raceAtomicAcquire(unsafe.Pointer(addr))
 	gp.raceignore--
 	return v
 }
@@ -248,9 +251,9 @@ func kolkovSyncAtomicAddInt64(addr *int64, delta int64) int64 {
 		return atomic.Xaddint64(addr, delta)
 	}
 	gp.raceignore++
+	raceAtomicAcquire(unsafe.Pointer(addr))
 	raceAtomicRelease(unsafe.Pointer(addr))
 	v := atomic.Xaddint64(addr, delta)
-	raceAtomicAcquire(unsafe.Pointer(addr))
 	gp.raceignore--
 	return v
 }
@@ -290,9 +293,9 @@ func kolkovSyncAtomicAddUintptr(addr *uintptr, delta uintptr) uintptr {
 		return atomic.Xadduintptr(addr, delta)
 	}
 	gp.raceignore++
+	raceAtomicAcquire(unsafe.Pointer(addr))
 	raceAtomicRelease(unsafe.Pointer(addr))
 	v := atomic.Xadduintptr(addr, delta)
-	raceAtomicAcquire(unsafe.Pointer(addr))
 	gp.raceignore--
 	return v
 }
@@ -308,9 +311,9 @@ func kolkovSyncAtomicSwapInt32(addr *int32, new int32) int32 {
 		return atomic.Xchgint32(addr, new)
 	}
 	gp.raceignore++
+	raceAtomicAcquire(unsafe.Pointer(addr))
 	raceAtomicRelease(unsafe.Pointer(addr))
 	v := atomic.Xchgint32(addr, new)
-	raceAtomicAcquire(unsafe.Pointer(addr))
 	gp.raceignore--
 	return v
 }
@@ -322,9 +325,9 @@ func kolkovSyncAtomicSwapInt64(addr *int64, new int64) int64 {
 		return atomic.Xchgint64(addr, new)
 	}
 	gp.raceignore++
+	raceAtomicAcquire(unsafe.Pointer(addr))
 	raceAtomicRelease(unsafe.Pointer(addr))
 	v := atomic.Xchgint64(addr, new)
-	raceAtomicAcquire(unsafe.Pointer(addr))
 	gp.raceignore--
 	return v
 }
@@ -336,9 +339,9 @@ func kolkovSyncAtomicSwapUint32(addr *uint32, new uint32) uint32 {
 		return atomic.Xchg(addr, new)
 	}
 	gp.raceignore++
+	raceAtomicAcquire(unsafe.Pointer(addr))
 	raceAtomicRelease(unsafe.Pointer(addr))
 	v := atomic.Xchg(addr, new)
-	raceAtomicAcquire(unsafe.Pointer(addr))
 	gp.raceignore--
 	return v
 }
@@ -350,9 +353,9 @@ func kolkovSyncAtomicSwapUint64(addr *uint64, new uint64) uint64 {
 		return atomic.Xchg64(addr, new)
 	}
 	gp.raceignore++
+	raceAtomicAcquire(unsafe.Pointer(addr))
 	raceAtomicRelease(unsafe.Pointer(addr))
 	v := atomic.Xchg64(addr, new)
-	raceAtomicAcquire(unsafe.Pointer(addr))
 	gp.raceignore--
 	return v
 }
@@ -364,9 +367,9 @@ func kolkovSyncAtomicSwapUintptr(addr *uintptr, new uintptr) uintptr {
 		return atomic.Xchguintptr(addr, new)
 	}
 	gp.raceignore++
+	raceAtomicAcquire(unsafe.Pointer(addr))
 	raceAtomicRelease(unsafe.Pointer(addr))
 	v := atomic.Xchguintptr(addr, new)
-	raceAtomicAcquire(unsafe.Pointer(addr))
 	gp.raceignore--
 	return v
 }
@@ -382,10 +385,10 @@ func kolkovSyncAtomicCompareAndSwapInt32(addr *int32, old, new int32) bool {
 		return atomic.Casint32(addr, old, new)
 	}
 	gp.raceignore++
-	raceAtomicRelease(unsafe.Pointer(addr))
 	swapped := atomic.Casint32(addr, old, new)
 	if swapped {
 		raceAtomicAcquire(unsafe.Pointer(addr))
+		raceAtomicRelease(unsafe.Pointer(addr))
 	}
 	gp.raceignore--
 	return swapped
@@ -398,10 +401,10 @@ func kolkovSyncAtomicCompareAndSwapInt64(addr *int64, old, new int64) bool {
 		return atomic.Casint64(addr, old, new)
 	}
 	gp.raceignore++
-	raceAtomicRelease(unsafe.Pointer(addr))
 	swapped := atomic.Casint64(addr, old, new)
 	if swapped {
 		raceAtomicAcquire(unsafe.Pointer(addr))
+		raceAtomicRelease(unsafe.Pointer(addr))
 	}
 	gp.raceignore--
 	return swapped
@@ -414,10 +417,10 @@ func kolkovSyncAtomicCompareAndSwapUint32(addr *uint32, old, new uint32) bool {
 		return atomic.Cas(addr, old, new)
 	}
 	gp.raceignore++
-	raceAtomicRelease(unsafe.Pointer(addr))
 	swapped := atomic.Cas(addr, old, new)
 	if swapped {
 		raceAtomicAcquire(unsafe.Pointer(addr))
+		raceAtomicRelease(unsafe.Pointer(addr))
 	}
 	gp.raceignore--
 	return swapped
@@ -430,10 +433,10 @@ func kolkovSyncAtomicCompareAndSwapUint64(addr *uint64, old, new uint64) bool {
 		return atomic.Cas64(addr, old, new)
 	}
 	gp.raceignore++
-	raceAtomicRelease(unsafe.Pointer(addr))
 	swapped := atomic.Cas64(addr, old, new)
 	if swapped {
 		raceAtomicAcquire(unsafe.Pointer(addr))
+		raceAtomicRelease(unsafe.Pointer(addr))
 	}
 	gp.raceignore--
 	return swapped
@@ -446,10 +449,10 @@ func kolkovSyncAtomicCompareAndSwapUintptr(addr *uintptr, old, new uintptr) bool
 		return atomic.Casuintptr(addr, old, new)
 	}
 	gp.raceignore++
-	raceAtomicRelease(unsafe.Pointer(addr))
 	swapped := atomic.Casuintptr(addr, old, new)
 	if swapped {
 		raceAtomicAcquire(unsafe.Pointer(addr))
+		raceAtomicRelease(unsafe.Pointer(addr))
 	}
 	gp.raceignore--
 	return swapped
@@ -494,9 +497,9 @@ func kolkovSyncAtomicAndUint32(addr *uint32, mask uint32) uint32 {
 		return atomic.And32(addr, mask)
 	}
 	gp.raceignore++
+	raceAtomicAcquire(unsafe.Pointer(addr))
 	raceAtomicRelease(unsafe.Pointer(addr))
 	v := atomic.And32(addr, mask)
-	raceAtomicAcquire(unsafe.Pointer(addr))
 	gp.raceignore--
 	return v
 }
@@ -508,9 +511,9 @@ func kolkovSyncAtomicAndUint64(addr *uint64, mask uint64) uint64 {
 		return atomic.And64(addr, mask)
 	}
 	gp.raceignore++
+	raceAtomicAcquire(unsafe.Pointer(addr))
 	raceAtomicRelease(unsafe.Pointer(addr))
 	v := atomic.And64(addr, mask)
-	raceAtomicAcquire(unsafe.Pointer(addr))
 	gp.raceignore--
 	return v
 }
@@ -568,9 +571,9 @@ func kolkovSyncAtomicOrUint32(addr *uint32, mask uint32) uint32 {
 		return atomic.Or32(addr, mask)
 	}
 	gp.raceignore++
+	raceAtomicAcquire(unsafe.Pointer(addr))
 	raceAtomicRelease(unsafe.Pointer(addr))
 	v := atomic.Or32(addr, mask)
-	raceAtomicAcquire(unsafe.Pointer(addr))
 	gp.raceignore--
 	return v
 }
@@ -582,9 +585,9 @@ func kolkovSyncAtomicOrUint64(addr *uint64, mask uint64) uint64 {
 		return atomic.Or64(addr, mask)
 	}
 	gp.raceignore++
+	raceAtomicAcquire(unsafe.Pointer(addr))
 	raceAtomicRelease(unsafe.Pointer(addr))
 	v := atomic.Or64(addr, mask)
-	raceAtomicAcquire(unsafe.Pointer(addr))
 	gp.raceignore--
 	return v
 }
