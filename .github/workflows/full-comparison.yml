@@ -52,6 +52,11 @@ jobs:
       env:
         CGO_ENABLED: 0
 
+    - name: Pre-compile stdlib with race instrumentation
+      run: |
+        echo "Compiling all stdlib packages with -race to ensure atomic stubs are linked..."
+        CGO_ENABLED=0 bin/go install -race std 2>&1 | tail -5
+
     - name: Run race detection correctness tests
       run: |
         echo "Running Go's built-in race detection test suite (runtime/race) with pure-Go detector..."
