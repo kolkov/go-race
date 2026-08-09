@@ -4,11 +4,7 @@
 
 //go:build race && !cgo
 
-// Pure Go race detector (Kolkov) atomic operations.
-// All 36 sync/atomic functions are now implemented in Go in
-// src/runtime/race_kolkov_atomic.go via go:linkname.
-// They provide proper acquire/release semantics for race detection.
-//
-// This file is intentionally empty -- it previously contained
-// TEXT/JMP entries that bypassed the race detector entirely,
-// causing false positives on all atomic-based synchronization.
+// This file is intentionally empty for the pure-Go race detector.
+// All sync/atomic function bodies are defined in
+// src/runtime/race_kolkov_amd64.s which bridges to Go implementations
+// in src/runtime/race_kolkov_atomic.go.

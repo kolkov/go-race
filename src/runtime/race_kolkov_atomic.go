@@ -76,7 +76,6 @@ func raceAtomicRelease(addr unsafe.Pointer) {
 // Loads: hardware load, then acquire
 // ---------------------------------------------------------------------------
 
-//go:linkname kolkovSyncAtomicLoadInt32 sync/atomic.LoadInt32
 //go:nosplit
 func kolkovSyncAtomicLoadInt32(addr *int32) int32 {
 	gp := getg()
@@ -90,7 +89,6 @@ func kolkovSyncAtomicLoadInt32(addr *int32) int32 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicLoadInt64 sync/atomic.LoadInt64
 //go:nosplit
 func kolkovSyncAtomicLoadInt64(addr *int64) int64 {
 	gp := getg()
@@ -104,7 +102,6 @@ func kolkovSyncAtomicLoadInt64(addr *int64) int64 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicLoadUint32 sync/atomic.LoadUint32
 //go:nosplit
 func kolkovSyncAtomicLoadUint32(addr *uint32) uint32 {
 	gp := getg()
@@ -118,7 +115,6 @@ func kolkovSyncAtomicLoadUint32(addr *uint32) uint32 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicLoadUint64 sync/atomic.LoadUint64
 //go:nosplit
 func kolkovSyncAtomicLoadUint64(addr *uint64) uint64 {
 	gp := getg()
@@ -132,7 +128,6 @@ func kolkovSyncAtomicLoadUint64(addr *uint64) uint64 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicLoadUintptr sync/atomic.LoadUintptr
 //go:nosplit
 func kolkovSyncAtomicLoadUintptr(addr *uintptr) uintptr {
 	gp := getg()
@@ -146,7 +141,6 @@ func kolkovSyncAtomicLoadUintptr(addr *uintptr) uintptr {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicLoadPointer sync/atomic.LoadPointer
 //go:nosplit
 func kolkovSyncAtomicLoadPointer(addr *unsafe.Pointer) unsafe.Pointer {
 	gp := getg()
@@ -164,7 +158,6 @@ func kolkovSyncAtomicLoadPointer(addr *unsafe.Pointer) unsafe.Pointer {
 // Stores: release, then hardware store
 // ---------------------------------------------------------------------------
 
-//go:linkname kolkovSyncAtomicStoreInt32 sync/atomic.StoreInt32
 //go:nosplit
 func kolkovSyncAtomicStoreInt32(addr *int32, val int32) {
 	gp := getg()
@@ -178,7 +171,6 @@ func kolkovSyncAtomicStoreInt32(addr *int32, val int32) {
 	gp.raceignore--
 }
 
-//go:linkname kolkovSyncAtomicStoreInt64 sync/atomic.StoreInt64
 //go:nosplit
 func kolkovSyncAtomicStoreInt64(addr *int64, val int64) {
 	gp := getg()
@@ -192,7 +184,6 @@ func kolkovSyncAtomicStoreInt64(addr *int64, val int64) {
 	gp.raceignore--
 }
 
-//go:linkname kolkovSyncAtomicStoreUint32 sync/atomic.StoreUint32
 //go:nosplit
 func kolkovSyncAtomicStoreUint32(addr *uint32, val uint32) {
 	gp := getg()
@@ -206,7 +197,6 @@ func kolkovSyncAtomicStoreUint32(addr *uint32, val uint32) {
 	gp.raceignore--
 }
 
-//go:linkname kolkovSyncAtomicStoreUint64 sync/atomic.StoreUint64
 //go:nosplit
 func kolkovSyncAtomicStoreUint64(addr *uint64, val uint64) {
 	gp := getg()
@@ -220,7 +210,6 @@ func kolkovSyncAtomicStoreUint64(addr *uint64, val uint64) {
 	gp.raceignore--
 }
 
-//go:linkname kolkovSyncAtomicStoreUintptr sync/atomic.StoreUintptr
 //go:nosplit
 func kolkovSyncAtomicStoreUintptr(addr *uintptr, val uintptr) {
 	gp := getg()
@@ -238,7 +227,6 @@ func kolkovSyncAtomicStoreUintptr(addr *uintptr, val uintptr) {
 // Add (RMW): release + hardware add + acquire
 // ---------------------------------------------------------------------------
 
-//go:linkname kolkovSyncAtomicAddInt32 sync/atomic.AddInt32
 //go:nosplit
 func kolkovSyncAtomicAddInt32(addr *int32, delta int32) int32 {
 	gp := getg()
@@ -253,7 +241,6 @@ func kolkovSyncAtomicAddInt32(addr *int32, delta int32) int32 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicAddInt64 sync/atomic.AddInt64
 //go:nosplit
 func kolkovSyncAtomicAddInt64(addr *int64, delta int64) int64 {
 	gp := getg()
@@ -268,7 +255,6 @@ func kolkovSyncAtomicAddInt64(addr *int64, delta int64) int64 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicAddUint32 sync/atomic.AddUint32
 //go:nosplit
 func kolkovSyncAtomicAddUint32(addr *uint32, delta uint32) uint32 {
 	gp := getg()
@@ -283,7 +269,6 @@ func kolkovSyncAtomicAddUint32(addr *uint32, delta uint32) uint32 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicAddUint64 sync/atomic.AddUint64
 //go:nosplit
 func kolkovSyncAtomicAddUint64(addr *uint64, delta uint64) uint64 {
 	gp := getg()
@@ -298,7 +283,6 @@ func kolkovSyncAtomicAddUint64(addr *uint64, delta uint64) uint64 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicAddUintptr sync/atomic.AddUintptr
 //go:nosplit
 func kolkovSyncAtomicAddUintptr(addr *uintptr, delta uintptr) uintptr {
 	gp := getg()
@@ -317,7 +301,6 @@ func kolkovSyncAtomicAddUintptr(addr *uintptr, delta uintptr) uintptr {
 // Swap (RMW): release + hardware swap + acquire
 // ---------------------------------------------------------------------------
 
-//go:linkname kolkovSyncAtomicSwapInt32 sync/atomic.SwapInt32
 //go:nosplit
 func kolkovSyncAtomicSwapInt32(addr *int32, new int32) int32 {
 	gp := getg()
@@ -332,7 +315,6 @@ func kolkovSyncAtomicSwapInt32(addr *int32, new int32) int32 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicSwapInt64 sync/atomic.SwapInt64
 //go:nosplit
 func kolkovSyncAtomicSwapInt64(addr *int64, new int64) int64 {
 	gp := getg()
@@ -347,7 +329,6 @@ func kolkovSyncAtomicSwapInt64(addr *int64, new int64) int64 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicSwapUint32 sync/atomic.SwapUint32
 //go:nosplit
 func kolkovSyncAtomicSwapUint32(addr *uint32, new uint32) uint32 {
 	gp := getg()
@@ -362,7 +343,6 @@ func kolkovSyncAtomicSwapUint32(addr *uint32, new uint32) uint32 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicSwapUint64 sync/atomic.SwapUint64
 //go:nosplit
 func kolkovSyncAtomicSwapUint64(addr *uint64, new uint64) uint64 {
 	gp := getg()
@@ -377,7 +357,6 @@ func kolkovSyncAtomicSwapUint64(addr *uint64, new uint64) uint64 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicSwapUintptr sync/atomic.SwapUintptr
 //go:nosplit
 func kolkovSyncAtomicSwapUintptr(addr *uintptr, new uintptr) uintptr {
 	gp := getg()
@@ -396,7 +375,6 @@ func kolkovSyncAtomicSwapUintptr(addr *uintptr, new uintptr) uintptr {
 // CompareAndSwap: release + CAS; acquire ONLY if swapped
 // ---------------------------------------------------------------------------
 
-//go:linkname kolkovSyncAtomicCompareAndSwapInt32 sync/atomic.CompareAndSwapInt32
 //go:nosplit
 func kolkovSyncAtomicCompareAndSwapInt32(addr *int32, old, new int32) bool {
 	gp := getg()
@@ -413,7 +391,6 @@ func kolkovSyncAtomicCompareAndSwapInt32(addr *int32, old, new int32) bool {
 	return swapped
 }
 
-//go:linkname kolkovSyncAtomicCompareAndSwapInt64 sync/atomic.CompareAndSwapInt64
 //go:nosplit
 func kolkovSyncAtomicCompareAndSwapInt64(addr *int64, old, new int64) bool {
 	gp := getg()
@@ -430,7 +407,6 @@ func kolkovSyncAtomicCompareAndSwapInt64(addr *int64, old, new int64) bool {
 	return swapped
 }
 
-//go:linkname kolkovSyncAtomicCompareAndSwapUint32 sync/atomic.CompareAndSwapUint32
 //go:nosplit
 func kolkovSyncAtomicCompareAndSwapUint32(addr *uint32, old, new uint32) bool {
 	gp := getg()
@@ -447,7 +423,6 @@ func kolkovSyncAtomicCompareAndSwapUint32(addr *uint32, old, new uint32) bool {
 	return swapped
 }
 
-//go:linkname kolkovSyncAtomicCompareAndSwapUint64 sync/atomic.CompareAndSwapUint64
 //go:nosplit
 func kolkovSyncAtomicCompareAndSwapUint64(addr *uint64, old, new uint64) bool {
 	gp := getg()
@@ -464,7 +439,6 @@ func kolkovSyncAtomicCompareAndSwapUint64(addr *uint64, old, new uint64) bool {
 	return swapped
 }
 
-//go:linkname kolkovSyncAtomicCompareAndSwapUintptr sync/atomic.CompareAndSwapUintptr
 //go:nosplit
 func kolkovSyncAtomicCompareAndSwapUintptr(addr *uintptr, old, new uintptr) bool {
 	gp := getg()
@@ -485,7 +459,6 @@ func kolkovSyncAtomicCompareAndSwapUintptr(addr *uintptr, old, new uintptr) bool
 // And (RMW): release + hardware and + acquire
 // ---------------------------------------------------------------------------
 
-//go:linkname kolkovSyncAtomicAndInt32 sync/atomic.AndInt32
 //go:nosplit
 func kolkovSyncAtomicAndInt32(addr *int32, mask int32) int32 {
 	gp := getg()
@@ -500,7 +473,6 @@ func kolkovSyncAtomicAndInt32(addr *int32, mask int32) int32 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicAndInt64 sync/atomic.AndInt64
 //go:nosplit
 func kolkovSyncAtomicAndInt64(addr *int64, mask int64) int64 {
 	gp := getg()
@@ -515,7 +487,6 @@ func kolkovSyncAtomicAndInt64(addr *int64, mask int64) int64 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicAndUint32 sync/atomic.AndUint32
 //go:nosplit
 func kolkovSyncAtomicAndUint32(addr *uint32, mask uint32) uint32 {
 	gp := getg()
@@ -530,7 +501,6 @@ func kolkovSyncAtomicAndUint32(addr *uint32, mask uint32) uint32 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicAndUint64 sync/atomic.AndUint64
 //go:nosplit
 func kolkovSyncAtomicAndUint64(addr *uint64, mask uint64) uint64 {
 	gp := getg()
@@ -545,7 +515,6 @@ func kolkovSyncAtomicAndUint64(addr *uint64, mask uint64) uint64 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicAndUintptr sync/atomic.AndUintptr
 //go:nosplit
 func kolkovSyncAtomicAndUintptr(addr *uintptr, mask uintptr) uintptr {
 	gp := getg()
@@ -564,7 +533,6 @@ func kolkovSyncAtomicAndUintptr(addr *uintptr, mask uintptr) uintptr {
 // Or (RMW): release + hardware or + acquire
 // ---------------------------------------------------------------------------
 
-//go:linkname kolkovSyncAtomicOrInt32 sync/atomic.OrInt32
 //go:nosplit
 func kolkovSyncAtomicOrInt32(addr *int32, mask int32) int32 {
 	gp := getg()
@@ -579,7 +547,6 @@ func kolkovSyncAtomicOrInt32(addr *int32, mask int32) int32 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicOrInt64 sync/atomic.OrInt64
 //go:nosplit
 func kolkovSyncAtomicOrInt64(addr *int64, mask int64) int64 {
 	gp := getg()
@@ -594,7 +561,6 @@ func kolkovSyncAtomicOrInt64(addr *int64, mask int64) int64 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicOrUint32 sync/atomic.OrUint32
 //go:nosplit
 func kolkovSyncAtomicOrUint32(addr *uint32, mask uint32) uint32 {
 	gp := getg()
@@ -609,7 +575,6 @@ func kolkovSyncAtomicOrUint32(addr *uint32, mask uint32) uint32 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicOrUint64 sync/atomic.OrUint64
 //go:nosplit
 func kolkovSyncAtomicOrUint64(addr *uint64, mask uint64) uint64 {
 	gp := getg()
@@ -624,7 +589,6 @@ func kolkovSyncAtomicOrUint64(addr *uint64, mask uint64) uint64 {
 	return v
 }
 
-//go:linkname kolkovSyncAtomicOrUintptr sync/atomic.OrUintptr
 //go:nosplit
 func kolkovSyncAtomicOrUintptr(addr *uintptr, mask uintptr) uintptr {
 	gp := getg()
